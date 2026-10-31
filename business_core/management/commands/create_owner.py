@@ -58,14 +58,26 @@ class Command(BaseCommand):
 
         if not password:
             if non_interactive or not sys.stdin.isatty():
-                password = 'password123'
+                password = 'Fringe@2026!'
             else:
                 import getpass
-                input_pwd = getpass.getpass("Enter Owner Password (min 6 chars) [default: password123]: ").strip()
-                password = input_pwd if input_pwd else 'password123'
+                input_pwd = getpass.getpass("Enter Owner Password (strong, min 8 chars) [default: Fringe@2026!]: ").strip()
+                password = input_pwd if input_pwd else 'Fringe@2026!'
 
-        if len(password) < 6:
-            raise CommandError("Password must be at least 6 characters in length.")
+        import re
+        missing = []
+        if len(password) < 8:
+            missing.append("at least 8 characters")
+        if not re.search(r'[A-Z]', password):
+            missing.append("at least one uppercase letter (A-Z)")
+        if not re.search(r'[a-z]', password):
+            missing.append("at least one lowercase letter (a-z)")
+        if not re.search(r'[0-9]', password):
+            missing.append("at least one number (0-9)")
+        if not re.search(r'[!@#$%^&*()_+\-=\[\]{};\':"\\|,.<>\/?]', password):
+            missing.append("at least one special character (!@#$%^&*)")
+        if missing:
+            raise CommandError(f"Password does not meet security standards. Missing: {', '.join(missing)}.")
 
         if not pin:
             if non_interactive or not sys.stdin.isatty():

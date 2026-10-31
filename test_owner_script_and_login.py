@@ -102,13 +102,13 @@ def test_owner_script_and_dual_login():
         'create_owner',
         username='owner',
         email='mitu@fringebusiness.com',
-        password='password123',
+        password='Fringe@2026!',
         pin='9999',
         first_name='Dr.',
         last_name='Mitu',
         non_interactive=True
     )
-    print("\n[OK] Default owner restored: username='owner', email='mitu@fringebusiness.com', password='password123'")
+    print("\n[OK] Default owner restored: username='owner', email='mitu@fringebusiness.com', password='Fringe@2026!'")
 
     print("\n" + "=" * 70)
     print("ALL SCRIPT AND DUAL USERNAME/EMAIL AUTHENTICATION TESTS PASSED 100%!")

@@ -59,6 +59,24 @@ class UserManagementSerializer(serializers.ModelSerializer):
     def get_has_pin(self, obj) -> bool:
         return bool(obj.pin_hash)
 
+    def validate_password(self, value):
+        if value:
+            import re
+            missing = []
+            if len(value) < 8:
+                missing.append("at least 8 characters")
+            if not re.search(r'[A-Z]', value):
+                missing.append("one uppercase letter (A-Z)")
+            if not re.search(r'[a-z]', value):
+                missing.append("one lowercase letter (a-z)")
+            if not re.search(r'[0-9]', value):
+                missing.append("one number (0-9)")
+            if not re.search(r'[!@#$%^&*()_+\-=\[\]{};\':"\\|,.<>\/?]', value):
+                missing.append("one special character (!@#$%^&*)")
+            if missing:
+                raise serializers.ValidationError(f"Password does not meet security standards. Missing: {', '.join(missing)}.")
+        return value
+
     def validate_pin(self, value):
         if value:
             if not value.isdigit():

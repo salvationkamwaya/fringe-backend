@@ -47,6 +47,7 @@ urlpatterns = [
     path('api/health/', health_check, name='health-check'),
     path('api/status/', health_check, name='status-check'),
     path('api/', include('business_core.urls')),
+    path('api/core/', include('business_core.urls')),
     path('api/catalog/', include('business_catalog.urls')),
     path('api/pos/', include('business_pos.urls')),
 ]

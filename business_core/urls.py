@@ -2,12 +2,13 @@ from django.urls import path, include
 from rest_framework.routers import DefaultRouter
 from .views import (
     login_view, me_view, logout_view, verify_manager_pin_view,
-    BusinessUnitViewSet, AuditLogViewSet
+    BusinessUnitViewSet, AuditLogViewSet, UserManagementViewSet
 )
 
 router = DefaultRouter()
 router.register(r'business-units', BusinessUnitViewSet, basename='business-unit')
 router.register(r'audit-logs', AuditLogViewSet, basename='audit-log')
+router.register(r'users', UserManagementViewSet, basename='user')
 
 urlpatterns = [
     path('auth/login/', login_view, name='auth-login'),

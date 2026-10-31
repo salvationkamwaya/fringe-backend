@@ -1,11 +1,11 @@
 from rest_framework import status, viewsets, permissions
-from rest_framework.decorators import api_view, permission_classes
+from rest_framework.decorators import api_view, permission_classes, action
 from rest_framework.response import Response
 from rest_framework.authtoken.models import Token
 from django.contrib.auth import authenticate
 from django.utils import timezone
 from .models import BusinessUnit, User, AuditLog
-from .serializers import BusinessUnitSerializer, UserSerializer, AuditLogSerializer
+from .serializers import BusinessUnitSerializer, UserSerializer, AuditLogSerializer, UserManagementSerializer
 from .audit import record_audit
 from .permissions import IsOwner, IsManagerOrOwner
 
@@ -216,3 +216,92 @@ class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
             qs = qs.filter(action__icontains=action)
 
         return qs[:200]
+
+
+class UserManagementViewSet(viewsets.ModelViewSet):
+    """
+    Staff and Role management.
+    NON-NEGOTIABLE ARCHITECTURAL RULE:
+    Strictly restricted to Business Owner (Dr. Mitu).
+    Only the Owner is authorized to create staff accounts, assign/change roles,
+    configure approval PINs, or activate/suspend employee accounts.
+    """
+    serializer_class = UserManagementSerializer
+    permission_classes = [IsOwner]
+
+    def get_queryset(self):
+        return User.objects.all().order_by('role', 'username')
+
+    def perform_create(self, serializer):
+        user = serializer.save()
+        record_audit(
+            request=self.request,
+            action='STAFF_CREATED',
+            entity_type='User',
+            entity_id=user.id,
+            after_value={
+                'username': user.username,
+                'role': user.role,
+                'unit': user.business_unit_id
+            },
+            metadata={'created_by': 'Owner'}
+        )
+
+    def perform_update(self, serializer):
+        before = self.get_object()
+        before_role = before.role
+        before_unit = before.business_unit_id
+        user = serializer.save()
+        record_audit(
+            request=self.request,
+            action='STAFF_ROLE_ASSIGNED',
+            entity_type='User',
+            entity_id=user.id,
+            before_value={'role': before_role, 'unit': before_unit},
+            after_value={'role': user.role, 'unit': user.business_unit_id},
+            metadata={'updated_by': 'Owner'}
+        )
+
+    @action(detail=True, methods=['post'])
+    def set_pin(self, request, pk=None):
+        """Owner sets or resets an employee's authorization PIN."""
+        user = self.get_object()
+        raw_pin = request.data.get('pin')
+        if not raw_pin or not str(raw_pin).isdigit() or len(str(raw_pin)) < 4 or len(str(raw_pin)) > 6:
+            return Response({'error': 'PIN must be a 4 to 6 digit numeric code.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user.set_pin(str(raw_pin))
+        user.save(update_fields=['pin_hash'])
+
+        record_audit(
+            request=request,
+            action='STAFF_PIN_SET',
+            entity_type='User',
+            entity_id=user.id,
+            metadata={'target_user': user.username, 'set_by': 'Owner'}
+        )
+        return Response({'message': f"PIN successfully configured for {user.username}."})
+
+    @action(detail=True, methods=['post'])
+    def toggle_active(self, request, pk=None):
+        """Owner toggles active/suspended status of an employee."""
+        user = self.get_object()
+        if user == request.user:
+            return Response({'error': 'Owner account cannot be deactivated.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        user.is_active = not user.is_active
+        user.save(update_fields=['is_active'])
+
+        action_name = 'STAFF_ACTIVATED' if user.is_active else 'STAFF_DEACTIVATED'
+        record_audit(
+            request=request,
+            action=action_name,
+            entity_type='User',
+            entity_id=user.id,
+            after_value={'is_active': user.is_active},
+            metadata={'target_user': user.username, 'toggled_by': 'Owner'}
+        )
+        return Response({
+            'message': f"Account {user.username} is now {'Active' if user.is_active else 'Suspended'}.",
+            'is_active': user.is_active
+        })

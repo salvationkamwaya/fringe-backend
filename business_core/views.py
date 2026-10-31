@@ -4,6 +4,7 @@ from rest_framework.response import Response
 from rest_framework.authtoken.models import Token
 from django.contrib.auth import authenticate
 from django.utils import timezone
+from django.db.models import Q
 from .models import BusinessUnit, User, AuditLog
 from .serializers import BusinessUnitSerializer, UserSerializer, AuditLogSerializer, UserManagementSerializer
 from .audit import record_audit
@@ -14,19 +15,29 @@ from .permissions import IsOwner, IsManagerOrOwner
 @permission_classes([permissions.AllowAny])
 def login_view(request):
     """
-    Authenticate user with username and password.
+    Authenticate user with username or email and password.
     Returns Auth Token and user session metadata.
     """
-    username = request.data.get('username')
+    identifier = request.data.get('username') or request.data.get('email') or request.data.get('login')
     password = request.data.get('password')
 
-    if not username or not password:
+    if not identifier or not password:
         return Response(
-            {'error': 'Username and password are required.'},
+            {'error': 'Username or email and password are required.'},
             status=status.HTTP_400_BAD_REQUEST
         )
 
-    user = authenticate(request, username=username, password=password)
+    # Allow login with either username or email (case-insensitive lookup)
+    identifier_str = str(identifier).strip()
+    user_candidate = User.objects.filter(
+        Q(username__iexact=identifier_str) | Q(email__iexact=identifier_str)
+    ).first()
+
+    if user_candidate:
+        user = authenticate(request, username=user_candidate.username, password=password)
+    else:
+        user = None
+
     if not user:
         return Response(
             {'error': 'Invalid username or password.'},

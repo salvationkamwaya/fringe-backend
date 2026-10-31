@@ -57,10 +57,12 @@ def login_view(request):
     else:
         units = list(BusinessUnit.objects.filter(id=user.business_unit_id).values('id', 'name', 'code'))
 
+    active_unit = user.business_unit_id if user.role != User.ROLE_OWNER else (request.headers.get('X-Business-Unit') or 'all')
+
     return Response({
         'token': token.key,
         'user': UserSerializer(user).data,
-        'active_unit': getattr(request, 'business_unit', user.business_unit_id or 'all'),
+        'active_unit': active_unit,
         'available_units': units,
     })
 

@@ -2,7 +2,7 @@
 URL configuration for Fringe Business System.
 """
 from django.contrib import admin
-from django.urls import path
+from django.urls import path, include
 from django.http import JsonResponse
 from django.db import connection
 import django
@@ -46,4 +46,7 @@ urlpatterns = [
     path('admin/', admin.site.urls),
     path('api/health/', health_check, name='health-check'),
     path('api/status/', health_check, name='status-check'),
+    path('api/', include('business_core.urls')),
+    path('api/catalog/', include('business_catalog.urls')),
+    path('api/pos/', include('business_pos.urls')),
 ]

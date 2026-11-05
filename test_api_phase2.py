@@ -54,7 +54,7 @@ def run_tests():
     client.defaults['HTTP_X_BUSINESS_UNIT'] = 'stationery'
 
     # 2. START A SHIFT FOR GRACE
-    print("\n[TEST 2] Starting shift for Grace with opening float ZMW 250.00...")
+    print("\n[TEST 2] Starting shift for Grace with opening float TSH 250.00...")
     res_shift = client.post('/api/pos/shifts/start_shift/', {'opening_float': '250.00'}, format='json')
     if res_shift.status_code == 400 and 'active open shift' in str(res_shift.data.get('error', '')):
         shift_data = res_shift.data['shift']
@@ -62,7 +62,7 @@ def run_tests():
         assert res_shift.status_code in (200, 201), f"Shift start failed: {res_shift.data}"
         shift_data = res_shift.data.get('shift', res_shift.data)
     shift_id = shift_data['id']
-    print(f" [OK] Shift #{shift_id} started/active. Opening Float: ZMW {shift_data['opening_float']}")
+    print(f" [OK] Shift #{shift_id} started/active. Opening Float: TSH {shift_data['opening_float']}")
 
     # 3. UNIT VS. PACK PRICING & FRACTIONAL STOCK DEDUCTION
     print("\n[TEST 3] Testing Unit vs. Pack pricing and fractional stock deduction...")
@@ -73,7 +73,7 @@ def run_tests():
     ratio = Decimal(pen_product.pack_unit_ratio)
     pack_price = pen_product.selling_price
     unit_price = pen_product.split_unit_price or (pen_product.selling_price / Decimal(pen_product.pack_unit_ratio))
-    print(f" Product: '{pen_product.name}' | Pack Price: ZMW {pack_price} | Unit Price: ZMW {unit_price} | Ratio: {ratio} | Stock: {initial_stock}")
+    print(f" Product: '{pen_product.name}' | Pack Price: TSH {pack_price} | Unit Price: TSH {unit_price} | Ratio: {ratio} | Stock: {initial_stock}")
 
     # 3a. Sell 2 individual pens (units)
     order_data_unit = {
@@ -102,7 +102,7 @@ def run_tests():
     pen_product.refresh_from_db()
     expected_stock_after_unit = initial_stock - (Decimal('2') / ratio)
     assert pen_product.stock_quantity == expected_stock_after_unit, f"Stock after unit sale mismatch: expected {expected_stock_after_unit}, got {pen_product.stock_quantity}"
-    print(f" [OK] Unit sale: 2 units @ ZMW {unit_price} = ZMW {expected_unit_total}. Stock correctly reduced by 2/{ratio} -> {pen_product.stock_quantity}")
+    print(f" [OK] Unit sale: 2 units @ TSH {unit_price} = TSH {expected_unit_total}. Stock correctly reduced by 2/{ratio} -> {pen_product.stock_quantity}")
 
     # 3b. Sell 1 whole pack (box)
     order_data_pack = {
@@ -127,7 +127,7 @@ def run_tests():
     pen_product.refresh_from_db()
     expected_stock_after_pack = expected_stock_after_unit - Decimal('1.0')
     assert pen_product.stock_quantity == expected_stock_after_pack, f"Stock after pack sale mismatch: expected {expected_stock_after_pack}, got {pen_product.stock_quantity}"
-    print(f" [OK] Pack sale: 1 pack @ ZMW {pack_price}. Stock correctly reduced by 1.0 -> {pen_product.stock_quantity}")
+    print(f" [OK] Pack sale: 1 pack @ TSH {pack_price}. Stock correctly reduced by 1.0 -> {pen_product.stock_quantity}")
 
     # 4. CUSTOMER REGISTRATION & CREDIT LIMITS
     print("\n[TEST 4] Testing Customer Registration & Credit Limits...")
@@ -142,7 +142,7 @@ def run_tests():
     }, format='json')
     assert res_cust.status_code == 201, f"Customer registration failed: {res_cust.data}"
     customer_id = res_cust.data['id']
-    print(f" [OK] Customer registered: '{res_cust.data['name']}' | Credit Limit: ZMW {res_cust.data['credit_limit']}")
+    print(f" [OK] Customer registered: '{res_cust.data['name']}' | Credit Limit: TSH {res_cust.data['credit_limit']}")
 
     # 4a. Credit sale within limit
     res_credit_sale_1 = client.post('/api/pos/orders/', {
@@ -159,7 +159,7 @@ def run_tests():
     cust = Customer.objects.get(id=customer_id)
     expected_debt_1 = pack_price * 2
     assert cust.current_balance == expected_debt_1, f"Customer balance mismatch: expected {expected_debt_1}, got {cust.current_balance}"
-    print(f" [OK] Credit sale within limit: ZMW {expected_debt_1} charged. Customer balance: ZMW {cust.current_balance}, Available: ZMW {cust.available_credit}")
+    print(f" [OK] Credit sale within limit: TSH {expected_debt_1} charged. Customer balance: TSH {cust.current_balance}, Available: TSH {cust.available_credit}")
 
     # 4b. Credit sale exceeding credit limit WITHOUT manager PIN -> MUST BE BLOCKED
     excess_qty = 20 # 20 * pack_price will far exceed remaining credit
@@ -192,7 +192,7 @@ def run_tests():
     cust.refresh_from_db()
     total_debt_expected = expected_debt_1 + (pack_price * excess_qty)
     assert cust.current_balance == total_debt_expected, f"Balance after override mismatch: expected {total_debt_expected}, got {cust.current_balance}"
-    print(f" [OK] Approved: Manager PIN 5678 authorized credit override. New balance: ZMW {cust.current_balance}")
+    print(f" [OK] Approved: Manager PIN 5678 authorized credit override. New balance: TSH {cust.current_balance}")
 
     # 5. CUSTOMER DEBT REPAYMENT & DRAWER RECONCILIATION
     print("\n[TEST 5] Testing Debt Repayment & Drawer Update...")
@@ -209,12 +209,12 @@ def run_tests():
     assert res_repay.status_code == 200, f"Repayment failed: {res_repay.data}"
     cust.refresh_from_db()
     assert cust.current_balance == total_debt_expected - payment_amt
-    print(f" [OK] Repaid ZMW {payment_amt}. Customer balance now: ZMW {cust.current_balance}")
+    print(f" [OK] Repaid TSH {payment_amt}. Customer balance now: TSH {cust.current_balance}")
 
     # Check shift total_debt_recovered
     shift = Shift.objects.get(id=shift_id)
     assert shift.total_debt_recovered == recovered_before + payment_amt, f"Shift debt recovered mismatch: {shift.total_debt_recovered}"
-    print(f" [OK] Shift #{shift_id} total_debt_recovered accurately updated by ZMW {payment_amt} -> ZMW {shift.total_debt_recovered}")
+    print(f" [OK] Shift #{shift_id} total_debt_recovered accurately updated by TSH {payment_amt} -> TSH {shift.total_debt_recovered}")
 
     # Check customer statement
     res_stmt = client.get(f'/api/pos/customers/{customer_id}/statement/')
@@ -231,7 +231,7 @@ def run_tests():
     assert res_aging.status_code == 200, f"Aging report failed: {res_aging.data}"
     assert len(res_aging.data['debtors']) >= 1
     summary = res_aging.data['summary']
-    print(f" [OK] Aging report generated. Total Current (0-30 days): ZMW {summary['total_current']} | Grand Total: ZMW {summary['grand_total_debt']}")
+    print(f" [OK] Aging report generated. Total Current (0-30 days): TSH {summary['total_current']} | Grand Total: TSH {summary['grand_total_debt']}")
 
     # 7. SUPPLIERS & PURCHASE ORDERS (PAYABLES)
     print("\n[TEST 7] Testing Suppliers & Purchase Orders...")
@@ -259,7 +259,7 @@ def run_tests():
     # Check supplier balance payable
     sup = Supplier.objects.get(id=supplier_id)
     assert sup.balance_payable == po_cost, f"Supplier balance mismatch: {sup.balance_payable}"
-    print(f" [OK] Purchase Order #{res_po.data['order_number']} created. Supplier payable: ZMW {sup.balance_payable}")
+    print(f" [OK] Purchase Order #{res_po.data['order_number']} created. Supplier payable: TSH {sup.balance_payable}")
 
     # Make partial payment to supplier
     pay_supplier_amt = Decimal('1000.00')
@@ -273,7 +273,7 @@ def run_tests():
     assert sup.balance_payable == po_cost - pay_supplier_amt
     po = PurchaseOrder.objects.get(id=po_id)
     assert po.status == 'PARTIALLY_PAID'
-    print(f" [OK] Paid ZMW {pay_supplier_amt} to supplier. Supplier payable remaining: ZMW {sup.balance_payable}, PO status: {po.status}")
+    print(f" [OK] Paid TSH {pay_supplier_amt} to supplier. Supplier payable remaining: TSH {sup.balance_payable}, PO status: {po.status}")
 
     # 8. STATIONERY REPORTS (END-OF-DAY)
     print("\n[TEST 8] Testing Stationery End-of-Day Report...")
@@ -281,12 +281,12 @@ def run_tests():
     assert res_stat_rep.status_code == 200, f"Stationery report failed: {res_stat_rep.data}"
     eod = res_stat_rep.data['end_of_day']
     print(f" [OK] End-of-Day Summary:")
-    print(f"      Total Revenue: ZMW {eod['total_revenue']}")
-    print(f"      Cash Sales: ZMW {eod['cash_sales']}")
-    print(f"      Credit Sales: ZMW {eod['credit_sales']}")
-    print(f"      Debt Recovered: ZMW {eod['debt_recovered']}")
-    print(f"      Expected Cash Drawer: ZMW {eod['expected_cash_drawer']}")
-    print(f"      Total Debtors Balance: ZMW {eod['total_debtors_balance']}")
+    print(f"      Total Revenue: TSH {eod['total_revenue']}")
+    print(f"      Cash Sales: TSH {eod['cash_sales']}")
+    print(f"      Credit Sales: TSH {eod['credit_sales']}")
+    print(f"      Debt Recovered: TSH {eod['debt_recovered']}")
+    print(f"      Expected Cash Drawer: TSH {eod['expected_cash_drawer']}")
+    print(f"      Total Debtors Balance: TSH {eod['total_debtors_balance']}")
 
     # 9. STRICT CROSS-UNIT ISOLATION
     print("\n[TEST 9] Verifying strict cross-unit isolation...")

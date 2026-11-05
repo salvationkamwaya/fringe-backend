@@ -3,7 +3,7 @@ from rest_framework.routers import DefaultRouter
 from .views import (
     ShiftViewSet, BarTabViewSet, OrderViewSet,
     CustomerViewSet, SupplierViewSet, PurchaseOrderViewSet,
-    bar_reports_view, stationery_reports_view, debtors_aging_report_view
+    bar_reports_view, stationery_reports_view, consolidated_reports_view, debtors_aging_report_view
 )
 
 router = DefaultRouter()
@@ -17,6 +17,7 @@ router.register(r'purchase-orders', PurchaseOrderViewSet, basename='purchase-ord
 urlpatterns = [
     path('reports/bar/', bar_reports_view, name='bar-reports'),
     path('reports/stationery/', stationery_reports_view, name='stationery-reports'),
+    path('reports/consolidated/', consolidated_reports_view, name='consolidated-reports'),
     path('debtors-aging/', debtors_aging_report_view, name='debtors-aging'),
     path('', include(router.urls)),
 ]

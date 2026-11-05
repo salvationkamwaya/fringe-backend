@@ -1,10 +1,11 @@
 import uuid
+import csv
 from decimal import Decimal
 from datetime import timedelta
 from django.db import transaction
 from django.utils import timezone
 from django.db.models import Sum, Count, F, Q
-from django.http import Http404
+from django.http import Http404, HttpResponse
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
@@ -36,24 +37,66 @@ class ShiftViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=['get'])
     def current(self, request):
         unit_id = getattr(request, 'business_unit', request.user.business_unit_id)
-        if unit_id == 'all':
+        if unit_id == 'all' or not unit_id:
             unit_id = request.user.business_unit_id or 'bar'
             
-        shift = Shift.objects.filter(
-            business_unit_id=unit_id,
-            cashier=request.user,
-            status=Shift.STATUS_OPEN
-        ).first()
-
-        if not shift:
-            return Response({'active_shift': None})
-        return Response({'active_shift': ShiftSerializer(shift).data})
+        user = request.user
+        is_manager = user.role in (User.ROLE_OWNER, User.ROLE_BAR_MANAGER, User.ROLE_STATIONERY_MANAGER)
+        
+        if is_manager:
+            # Managers and Owner see active cashier shift for their unit
+            shift = Shift.objects.filter(
+                business_unit_id=unit_id,
+                status=Shift.STATUS_OPEN
+            ).first()
+            active_shifts = list(Shift.objects.filter(
+                business_unit_id=unit_id,
+                status=Shift.STATUS_OPEN
+            ).values(
+                'id', 'cashier__username', 'cashier__first_name', 'cashier__last_name',
+                'opening_float', 'total_sales_cash', 'total_sales_mobile', 'opened_at'
+            ))
+            return Response({
+                'active_shift': ShiftSerializer(shift).data if shift else None,
+                'active_shifts_list': active_shifts,
+                'is_manager_oversight': True
+            })
+        else:
+            shift = Shift.objects.filter(
+                business_unit_id=unit_id,
+                cashier=user,
+                status=Shift.STATUS_OPEN
+            ).first()
+            return Response({
+                'active_shift': ShiftSerializer(shift).data if shift else None,
+                'is_manager_oversight': False
+            })
 
     @action(detail=False, methods=['post'])
     def start_shift(self, request):
         unit_id = getattr(request, 'business_unit', request.user.business_unit_id)
         if unit_id == 'all':
             unit_id = request.user.business_unit_id or 'bar'
+
+        user = request.user
+        # Enforce role boundaries: Only frontline cashier staff operate cash drawers
+        if user.role in (User.ROLE_OWNER, User.ROLE_BAR_MANAGER, User.ROLE_STATIONERY_MANAGER, User.ROLE_STOCK_CLERK):
+            return Response({
+                'error': 'Permission Denied: Managers and the Business Owner do not operate cashier register drawers. Register shifts can only be opened by designated cashiers (Bartender / Stationery Cashier).',
+                'code': 'ROLE_SHIFT_RESTRICTED'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        if unit_id == 'bar' and user.role != User.ROLE_BARTENDER:
+            return Response({
+                'error': 'Only a Bartender can open a register shift for Bar & Lounge.',
+                'code': 'ROLE_UNIT_MISMATCH'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        if unit_id == 'stationery' and user.role != User.ROLE_STATIONERY_CASHIER:
+            return Response({
+                'error': 'Only a Stationery Cashier can open a register shift for Stationery & Retail.',
+                'code': 'ROLE_UNIT_MISMATCH'
+            }, status=status.HTTP_403_FORBIDDEN)
 
         existing = Shift.objects.filter(
             business_unit_id=unit_id,
@@ -263,7 +306,7 @@ class CustomerViewSet(viewsets.ModelViewSet):
 
         if amount > customer.current_balance:
             return Response({
-                'error': f"Payment amount (ZMW {amount}) exceeds current balance due (ZMW {customer.current_balance})."
+                'error': f"Payment amount (TSH {amount}) exceeds current balance due (TSH {customer.current_balance})."
             }, status=status.HTTP_400_BAD_REQUEST)
 
         balance_before = customer.current_balance
@@ -304,7 +347,7 @@ class CustomerViewSet(viewsets.ModelViewSet):
         )
 
         return Response({
-            'message': f"Payment of ZMW {amount} recorded for {customer.name}.",
+            'message': f"Payment of TSH {amount} recorded for {customer.name}.",
             'customer': CustomerSerializer(customer).data,
             'transaction': CustomerCreditTransactionSerializer(tx).data
         })
@@ -506,7 +549,7 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         )
 
         return Response({
-            'message': f"Payment of ZMW {amount} recorded to {supplier.name}.",
+            'message': f"Payment of TSH {amount} recorded to {supplier.name}.",
             'purchase_order': PurchaseOrderSerializer(po).data
         })
 
@@ -532,6 +575,26 @@ class OrderViewSet(viewsets.ModelViewSet):
             unit_id = request.user.business_unit_id or 'bar'
 
         user = request.user
+
+        # ENFORCE STRICT CORE ROLES: Managers, Business Owners, and Stock Clerks cannot record sales
+        if user.role in (User.ROLE_OWNER, User.ROLE_BAR_MANAGER, User.ROLE_STATIONERY_MANAGER, User.ROLE_STOCK_CLERK):
+            return Response({
+                'error': 'Sales recording is strictly reserved for frontline staff (Bartender / Stationery Cashier). Managers and Business Owners perform oversight, inventory, reporting, and approvals only.',
+                'code': 'SALES_RECORDING_RESTRICTED'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        if unit_id == 'bar' and user.role != User.ROLE_BARTENDER:
+            return Response({
+                'error': 'Only a designated Bartender can record sales in the Bar & Lounge.',
+                'code': 'ROLE_UNIT_MISMATCH'
+            }, status=status.HTTP_403_FORBIDDEN)
+
+        if unit_id == 'stationery' and user.role != User.ROLE_STATIONERY_CASHIER:
+            return Response({
+                'error': 'Only a designated Stationery Cashier can record sales in Stationery & Retail.',
+                'code': 'ROLE_UNIT_MISMATCH'
+            }, status=status.HTTP_403_FORBIDDEN)
+
         items_data = request.data.get('items', [])
         payments_data = request.data.get('payments', [])
         tab_id = request.data.get('tab_id')
@@ -644,7 +707,7 @@ class OrderViewSet(viewsets.ModelViewSet):
                                 break
                     if not approver and not user.is_stationery_manager_or_owner:
                         return Response({
-                            'error': f"Credit limit exceeded! Limit: ZMW {customer.credit_limit}, Current Owed: ZMW {customer.current_balance}. Manager authorization required.",
+                            'error': f"Credit limit exceeded! Limit: TSH {customer.credit_limit}, Current Owed: TSH {customer.current_balance}. Manager authorization required.",
                             'code': 'CREDIT_LIMIT_EXCEEDED'
                         }, status=status.HTTP_403_FORBIDDEN)
 
@@ -868,41 +931,242 @@ def bar_reports_view(request):
     if unit_id not in ('bar', 'all') and request.user.role != User.ROLE_OWNER:
         raise Http404("Report not found.")
 
-    product_sales = OrderItem.objects.filter(
-        order__business_unit_id='bar',
-        order__status='COMPLETED'
-    ).values(
-        'product__id', 'product__name', 'product__is_alcoholic'
-    ).annotate(
-        total_quantity=Sum('quantity'),
-        total_revenue=Sum('subtotal')
-    ).order_by('-total_revenue')
-
-    stock_on_hand = Product.objects.filter(
-        business_unit_id='bar',
-        is_active=True
-    ).values(
-        'id', 'name', 'stock_quantity', 'reorder_threshold', 'selling_price', 'cost_price', 'is_alcoholic'
-    ).order_by('stock_quantity')
-
-    completed_orders = Order.objects.filter(
-        business_unit_id='bar',
-        status='COMPLETED'
-    )
+    completed_orders = Order.objects.filter(business_unit_id='bar', status=Order.STATUS_COMPLETED)
     total_revenue = completed_orders.aggregate(total=Sum('final_amount'))['total'] or Decimal('0.00')
+    total_orders = completed_orders.count()
+    avg_order_value = (total_revenue / total_orders) if total_orders > 0 else Decimal('0.00')
 
-    items = OrderItem.objects.filter(order__business_unit_id='bar', order__status='COMPLETED')
+    # Payments breakdown
+    payments = Payment.objects.filter(order__business_unit_id='bar', order__status=Order.STATUS_COMPLETED)
+    cash_payments = payments.filter(payment_method='CASH')
+    momo_payments = payments.filter(payment_method='MOBILE_MONEY')
+    cash_total = cash_payments.aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
+    cash_count = cash_payments.count()
+    momo_total = momo_payments.aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
+    momo_count = momo_payments.count()
+
+    # Product Sales breakdown
+    items = OrderItem.objects.filter(order__business_unit_id='bar', order__status=Order.STATUS_COMPLETED).select_related('product')
+    total_drinks_sold = Decimal('0.00')
+    alcoholic_revenue = Decimal('0.00')
+    alcoholic_count = Decimal('0.00')
+    non_alcoholic_revenue = Decimal('0.00')
+    non_alcoholic_count = Decimal('0.00')
     cogs = Decimal('0.00')
+
+    product_dict = {}
     for itm in items:
-        cogs += itm.product.cost_price * itm.quantity
+        pid = itm.product_id
+        p_name = itm.product.name
+        is_alc = itm.product.is_alcoholic
+        cost_price = itm.product.cost_price
+        selling_price = itm.unit_price
+        qty = itm.quantity
+        subtotal = itm.subtotal
+        item_cogs = cost_price * qty
+        cogs += item_cogs
+        total_drinks_sold += qty
+
+        if is_alc:
+            alcoholic_revenue += subtotal
+            alcoholic_count += qty
+        else:
+            non_alcoholic_revenue += subtotal
+            non_alcoholic_count += qty
+
+        if pid not in product_dict:
+            product_dict[pid] = {
+                'product__id': pid,
+                'product__name': p_name,
+                'product__is_alcoholic': is_alc,
+                'unit_cost': str(cost_price),
+                'unit_price': str(selling_price),
+                'total_quantity': Decimal('0.00'),
+                'total_revenue': Decimal('0.00'),
+                'total_cogs': Decimal('0.00'),
+                'line_profit': Decimal('0.00'),
+            }
+        product_dict[pid]['total_quantity'] += qty
+        product_dict[pid]['total_revenue'] += subtotal
+        product_dict[pid]['total_cogs'] += item_cogs
+        product_dict[pid]['line_profit'] += (subtotal - item_cogs)
+
+    product_sales = []
+    for p in product_dict.values():
+        rev = p['total_revenue']
+        profit = p['line_profit']
+        margin = ((profit / rev) * 100) if rev > 0 else Decimal('0.00')
+        product_sales.append({
+            'product__id': p['product__id'],
+            'product__name': p['product__name'],
+            'product__is_alcoholic': p['product__is_alcoholic'],
+            'unit_cost': p['unit_cost'],
+            'unit_price': p['unit_price'],
+            'total_quantity': int(p['total_quantity']),
+            'total_revenue': str(rev),
+            'total_cogs': str(p['total_cogs']),
+            'line_profit': str(profit),
+            'margin_percent': f"{margin:.1f}%"
+        })
+    product_sales.sort(key=lambda x: Decimal(x['total_revenue']), reverse=True)
 
     gross_profit = total_revenue - cogs
     gross_margin = ((gross_profit / total_revenue) * 100) if total_revenue > 0 else Decimal('0.00')
 
+    # Inventory Valuation
+    bar_products = Product.objects.filter(business_unit_id='bar', is_active=True)
+    val_at_cost = Decimal('0.00')
+    val_at_retail = Decimal('0.00')
+    total_stock_units = Decimal('0.00')
+    low_stock_count = 0
+    out_of_stock_count = 0
+    stock_on_hand = []
+
+    for bp in bar_products:
+        val_at_cost += bp.stock_quantity * bp.cost_price
+        val_at_retail += bp.stock_quantity * bp.selling_price
+        total_stock_units += bp.stock_quantity
+        is_low = bp.stock_quantity <= bp.reorder_threshold
+        is_out = bp.stock_quantity <= 0
+        if is_out:
+            out_of_stock_count += 1
+        elif is_low:
+            low_stock_count += 1
+
+        stock_on_hand.append({
+            'id': bp.id,
+            'name': bp.name,
+            'stock_quantity': str(bp.stock_quantity),
+            'reorder_threshold': str(bp.reorder_threshold),
+            'cost_price': str(bp.cost_price),
+            'selling_price': str(bp.selling_price),
+            'is_alcoholic': bp.is_alcoholic,
+            'valuation_cost': str(bp.stock_quantity * bp.cost_price),
+            'valuation_retail': str(bp.stock_quantity * bp.selling_price),
+            'status': 'Out of Stock' if is_out else ('Low Stock' if is_low else 'Optimal')
+        })
+    stock_on_hand.sort(key=lambda x: Decimal(x['stock_quantity']))
+
+    # Recent Shifts
+    recent_shifts = []
+    for s in Shift.objects.filter(business_unit_id='bar').select_related('cashier').order_by('-started_at')[:10]:
+        recent_shifts.append({
+            'id': s.id,
+            'cashier': s.cashier.username,
+            'started_at': s.started_at.isoformat() if s.started_at else None,
+            'ended_at': s.ended_at.isoformat() if s.ended_at else None,
+            'opening_float': str(s.opening_float),
+            'total_sales_cash': str(s.total_sales_cash),
+            'total_sales_mobile': str(s.total_sales_mobile),
+            'expected_cash': str(s.expected_cash),
+            'counted_cash': str(s.counted_cash) if s.counted_cash is not None else None,
+            'variance': str(s.variance) if s.variance is not None else '0.00',
+            'status': s.status
+        })
+
+    # CSV Download Check
+    if request.query_params.get('export') == 'csv':
+        response = HttpResponse(content_type='text/csv; charset=utf-8')
+        response['Content-Disposition'] = f'attachment; filename="bar_comprehensive_report_{timezone.now().strftime("%Y%m%d_%H%M")}.csv"'
+        writer = csv.writer(response)
+        
+        writer.writerow(['THE FRINGE BAR & LOUNGE - COMPREHENSIVE BUSINESS REPORT'])
+        writer.writerow(['Generated At', timezone.now().strftime('%Y-%m-%d %H:%M:%S'), 'Currency', 'TSH'])
+        writer.writerow([])
+
+        writer.writerow(['EXECUTIVE FINANCIAL SUMMARY'])
+        writer.writerow(['Total Revenue (TSH)', f"{total_revenue:.2f}"])
+        writer.writerow(['Total Orders Completed', total_orders])
+        writer.writerow(['Average Order Value (TSH)', f"{avg_order_value:.2f}"])
+        writer.writerow(['Cost of Goods Sold (COGS) (TSH)', f"{cogs:.2f}"])
+        writer.writerow(['Gross Profit (TSH)', f"{gross_profit:.2f}"])
+        writer.writerow(['Gross Margin', f"{gross_margin:.1f}%"])
+        writer.writerow(['Alcoholic Drinks Revenue (TSH)', f"{alcoholic_revenue:.2f}"])
+        writer.writerow(['Non-Alcoholic Drinks Revenue (TSH)', f"{non_alcoholic_revenue:.2f}"])
+        writer.writerow([])
+
+        writer.writerow(['PAYMENT TENDERS BREAKDOWN'])
+        writer.writerow(['Tender Method', 'Transactions Count', 'Total Amount (TSH)'])
+        writer.writerow(['Cash', cash_count, f"{cash_total:.2f}"])
+        writer.writerow(['Mobile Money (M-Pesa / Airtel)', momo_count, f"{momo_total:.2f}"])
+        writer.writerow([])
+
+        writer.writerow(['INVENTORY VALUATION'])
+        writer.writerow(['Total Catalog Items', len(bar_products)])
+        writer.writerow(['Total Stock Units on Hand', f"{total_stock_units:.0f}"])
+        writer.writerow(['Inventory Valuation at Cost (TSH)', f"{val_at_cost:.2f}"])
+        writer.writerow(['Inventory Valuation at Retail (TSH)', f"{val_at_retail:.2f}"])
+        writer.writerow(['Potential Unrealized Gross Profit (TSH)', f"{(val_at_retail - val_at_cost):.2f}"])
+        writer.writerow(['Low Stock Alert Items', low_stock_count])
+        writer.writerow(['Out of Stock Items', out_of_stock_count])
+        writer.writerow([])
+
+        writer.writerow(['PRODUCT SALES BREAKDOWN'])
+        writer.writerow(['Product Name', 'Classification', 'Units Sold', 'Unit Cost (TSH)', 'Selling Price (TSH)', 'Total Revenue (TSH)', 'Gross Profit (TSH)', 'Margin %'])
+        for p in product_sales:
+            writer.writerow([
+                p['product__name'],
+                'Alcoholic (18+)' if p['product__is_alcoholic'] else 'Non-Alcoholic',
+                p['total_quantity'],
+                p['unit_cost'],
+                p['unit_price'],
+                p['total_revenue'],
+                p['line_profit'],
+                p['margin_percent']
+            ])
+        writer.writerow([])
+
+        writer.writerow(['STOCK-ON-HAND STATUS'])
+        writer.writerow(['Product Name', 'Stock Qty', 'Reorder Threshold', 'Cost Price (TSH)', 'Selling Price (TSH)', 'Value at Cost (TSH)', 'Status'])
+        for s in stock_on_hand:
+            writer.writerow([
+                s['name'],
+                s['stock_quantity'],
+                s['reorder_threshold'],
+                s['cost_price'],
+                s['selling_price'],
+                s['valuation_cost'],
+                s['status']
+            ])
+
+        return response
+
     return Response({
         'business_unit': 'bar',
-        'product_sales': list(product_sales),
-        'stock_on_hand': list(stock_on_hand),
+        'currency': 'TSH',
+        'generated_at': timezone.now().isoformat(),
+        'summary': {
+            'total_revenue': str(total_revenue),
+            'total_orders': total_orders,
+            'avg_order_value': f"{avg_order_value:.2f}",
+            'total_drinks_sold': int(total_drinks_sold),
+            'cogs': str(cogs),
+            'gross_profit': str(gross_profit),
+            'gross_margin_percent': f"{gross_margin:.1f}%",
+            'alcoholic_revenue': str(alcoholic_revenue),
+            'alcoholic_count': int(alcoholic_count),
+            'non_alcoholic_revenue': str(non_alcoholic_revenue),
+            'non_alcoholic_count': int(non_alcoholic_count),
+        },
+        'payment_tenders': {
+            'cash_total': str(cash_total),
+            'cash_count': cash_count,
+            'mobile_money_total': str(momo_total),
+            'mobile_money_count': momo_count,
+            'total_tendered': str(cash_total + momo_total)
+        },
+        'inventory_valuation': {
+            'total_items': len(bar_products),
+            'total_units': int(total_stock_units),
+            'valuation_at_cost': str(val_at_cost),
+            'valuation_at_retail': str(val_at_retail),
+            'potential_gross_profit': str(val_at_retail - val_at_cost),
+            'low_stock_count': low_stock_count,
+            'out_of_stock_count': out_of_stock_count,
+        },
+        'product_sales': product_sales,
+        'stock_on_hand': stock_on_hand,
+        'recent_shifts': recent_shifts,
         'profit_snapshot': {
             'total_revenue': str(total_revenue),
             'cogs': str(cogs),
@@ -916,56 +1180,256 @@ def bar_reports_view(request):
 @permission_classes([permissions.IsAuthenticated])
 def stationery_reports_view(request):
     """
-    Stationery reports:
-    - End-of-Day Report (Cash, Mobile, Credit, Debt Recoveries, Total)
-    - Product Sales Breakdown
-    - Stock on Hand with Reorder Alerts
-    - Debtors Summary
+    Stationery comprehensive reports:
+    - End-of-Day Financial Totals (Cash, Mobile, Credit, Recoveries, Expected Drawer)
+    - Pack vs Single Sales Split
+    - Product Sales Breakdown with Margins
+    - Debtors Aging (0-30, 31-60, 61-90, 90+ days)
+    - Supplier Payables
+    - Inventory Valuation at Cost and Retail
     """
     unit_id = getattr(request, 'business_unit', request.user.business_unit_id)
     if unit_id not in ('stationery', 'all') and request.user.role != User.ROLE_OWNER:
         raise Http404("Report not found.")
 
-    # 1. Product Sales
-    product_sales = OrderItem.objects.filter(
-        order__business_unit_id='stationery',
-        order__status='COMPLETED'
-    ).values(
-        'product__id', 'product__name', 'is_pack_sale'
-    ).annotate(
-        total_quantity=Sum('quantity'),
-        total_revenue=Sum('subtotal')
-    ).order_by('-total_revenue')
-
-    # 2. Stock on Hand
-    stock_on_hand = Product.objects.filter(
-        business_unit_id='stationery',
-        is_active=True
-    ).values(
-        'id', 'name', 'stock_quantity', 'reorder_threshold', 'selling_price', 'cost_price', 'is_pack', 'pack_name'
-    ).order_by('stock_quantity')
-
-    # 3. Financial Totals
-    completed = Order.objects.filter(business_unit_id='stationery', status='COMPLETED')
+    completed = Order.objects.filter(business_unit_id='stationery', status=Order.STATUS_COMPLETED)
     total_revenue = completed.aggregate(total=Sum('final_amount'))['total'] or Decimal('0.00')
+    total_orders = completed.count()
+    avg_order_value = (total_revenue / total_orders) if total_orders > 0 else Decimal('0.00')
 
-    payments = Payment.objects.filter(order__business_unit_id='stationery', order__status='COMPLETED')
+    payments = Payment.objects.filter(order__business_unit_id='stationery', order__status=Order.STATUS_COMPLETED)
     cash_sales = payments.filter(payment_method='CASH').aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
+    cash_count = payments.filter(payment_method='CASH').count()
     mobile_sales = payments.filter(payment_method='MOBILE_MONEY').aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
+    mobile_count = payments.filter(payment_method='MOBILE_MONEY').count()
     credit_sales = payments.filter(payment_method='CREDIT').aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
+    credit_count = payments.filter(payment_method='CREDIT').count()
 
     # Recovered customer debts
     debt_recovered = CustomerCreditTransaction.objects.filter(
         business_unit_id='stationery', transaction_type='PAYMENT_RECEIVED'
     ).aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
 
-    # Total Debtors Balance
-    total_debtors = Customer.objects.filter(business_unit_id='stationery').aggregate(t=Sum('current_balance'))['t'] or Decimal('0.00')
+    # Pack vs Single split & COGS
+    items = OrderItem.objects.filter(order__business_unit_id='stationery', order__status=Order.STATUS_COMPLETED).select_related('product')
+    cogs = Decimal('0.00')
+    pack_sales_rev = Decimal('0.00')
+    pack_sales_count = Decimal('0.00')
+    single_sales_rev = Decimal('0.00')
+    single_sales_count = Decimal('0.00')
+    product_dict = {}
+
+    for itm in items:
+        p = itm.product
+        qty = itm.quantity
+        subtotal = itm.subtotal
+        is_pack = itm.is_pack_sale
+
+        if p.is_pack and not is_pack and p.allow_split_sale:
+            item_cost = (p.cost_price / Decimal(p.pack_unit_ratio)) * qty
+            single_sales_rev += subtotal
+            single_sales_count += qty
+        else:
+            item_cost = p.cost_price * qty
+            pack_sales_rev += subtotal
+            pack_sales_count += qty
+
+        cogs += item_cost
+        key = (p.id, is_pack)
+        if key not in product_dict:
+            product_dict[key] = {
+                'product__id': p.id,
+                'product__name': p.name,
+                'is_pack_sale': is_pack,
+                'unit_cost': str(p.cost_price),
+                'total_quantity': Decimal('0.00'),
+                'total_revenue': Decimal('0.00'),
+                'total_cogs': Decimal('0.00'),
+                'line_profit': Decimal('0.00')
+            }
+        product_dict[key]['total_quantity'] += qty
+        product_dict[key]['total_revenue'] += subtotal
+        product_dict[key]['total_cogs'] += item_cost
+        product_dict[key]['line_profit'] += (subtotal - item_cost)
+
+    product_sales = []
+    for p in product_dict.values():
+        rev = p['total_revenue']
+        profit = p['line_profit']
+        margin = ((profit / rev) * 100) if rev > 0 else Decimal('0.00')
+        product_sales.append({
+            'product__id': p['product__id'],
+            'product__name': p['product__name'],
+            'is_pack_sale': p['is_pack_sale'],
+            'sale_type': 'Whole Pack' if p['is_pack_sale'] else 'Single Piece',
+            'unit_cost': p['unit_cost'],
+            'total_quantity': int(p['total_quantity']),
+            'total_revenue': str(rev),
+            'total_cogs': str(p['total_cogs']),
+            'line_profit': str(profit),
+            'margin_percent': f"{margin:.1f}%"
+        })
+    product_sales.sort(key=lambda x: Decimal(x['total_revenue']), reverse=True)
+
+    gross_profit = total_revenue - cogs
+    gross_margin = ((gross_profit / total_revenue) * 100) if total_revenue > 0 else Decimal('0.00')
+
+    # Debtors Aging
+    now = timezone.now()
+    active_customers = Customer.objects.filter(business_unit_id='stationery', is_active=True)
+    total_debtors = active_customers.aggregate(t=Sum('current_balance'))['t'] or Decimal('0.00')
+    active_debtors_count = active_customers.filter(current_balance__gt=0).count()
+
+    aging_0_30 = Decimal('0.00')
+    aging_31_60 = Decimal('0.00')
+    aging_61_90 = Decimal('0.00')
+    aging_90_plus = Decimal('0.00')
+
+    unsettled_orders = Order.objects.filter(
+        business_unit_id='stationery',
+        status=Order.STATUS_COMPLETED,
+        payments__payment_method='CREDIT'
+    ).distinct()
+
+    for ord in unsettled_orders:
+        credit_amt = ord.payments.filter(payment_method='CREDIT').aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
+        age_days = (now - ord.created_at).days
+        if age_days <= 30:
+            aging_0_30 += credit_amt
+        elif age_days <= 60:
+            aging_31_60 += credit_amt
+        elif age_days <= 90:
+            aging_61_90 += credit_amt
+        else:
+            aging_90_plus += credit_amt
+
+    top_debtors = []
+    for c in active_customers.filter(current_balance__gt=0).order_by('-current_balance')[:10]:
+        top_debtors.append({
+            'id': c.id,
+            'name': c.name,
+            'phone': c.phone,
+            'current_balance': str(c.current_balance),
+            'credit_limit': str(c.credit_limit),
+            'available_credit': str(c.available_credit)
+        })
+
+    # Supplier Payables
+    suppliers_count = Supplier.objects.filter(business_unit_id='stationery', is_active=True).count()
+    pos = PurchaseOrder.objects.filter(business_unit_id='stationery')
+    total_po_count = pos.count()
+    total_po_cost = pos.aggregate(t=Sum('total_cost'))['t'] or Decimal('0.00')
+    total_paid_to_suppliers = SupplierPayment.objects.filter(purchase_order__business_unit_id='stationery').aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
+    total_payables_outstanding = max(Decimal('0.00'), total_po_cost - total_paid_to_suppliers)
+
+    # Inventory Valuation
+    stat_products = Product.objects.filter(business_unit_id='stationery', is_active=True)
+    val_at_cost = Decimal('0.00')
+    val_at_retail = Decimal('0.00')
+    low_stock_count = 0
+    out_of_stock_count = 0
+    stock_on_hand = []
+
+    for sp in stat_products:
+        val_at_cost += sp.stock_quantity * sp.cost_price
+        val_at_retail += sp.stock_quantity * sp.selling_price
+        is_low = sp.stock_quantity <= sp.reorder_threshold
+        is_out = sp.stock_quantity <= 0
+        if is_out:
+            out_of_stock_count += 1
+        elif is_low:
+            low_stock_count += 1
+
+        stock_on_hand.append({
+            'id': sp.id,
+            'name': sp.name,
+            'stock_quantity': str(sp.stock_quantity),
+            'reorder_threshold': str(sp.reorder_threshold),
+            'cost_price': str(sp.cost_price),
+            'selling_price': str(sp.selling_price),
+            'is_pack': sp.is_pack,
+            'pack_name': sp.pack_name,
+            'valuation_cost': str(sp.stock_quantity * sp.cost_price),
+            'valuation_retail': str(sp.stock_quantity * sp.selling_price),
+            'status': 'Out of Stock' if is_out else ('Low Stock' if is_low else 'Optimal')
+        })
+    stock_on_hand.sort(key=lambda x: Decimal(x['stock_quantity']))
+
+    # CSV Download Check
+    if request.query_params.get('export') == 'csv':
+        response = HttpResponse(content_type='text/csv; charset=utf-8')
+        response['Content-Disposition'] = f'attachment; filename="stationery_comprehensive_report_{timezone.now().strftime("%Y%m%d_%H%M")}.csv"'
+        writer = csv.writer(response)
+
+        writer.writerow(['THE FRINGE STATIONERY & RETAIL - COMPREHENSIVE BUSINESS REPORT'])
+        writer.writerow(['Generated At', timezone.now().strftime('%Y-%m-%d %H:%M:%S'), 'Currency', 'TSH'])
+        writer.writerow([])
+
+        writer.writerow(['END-OF-DAY FINANCIAL SUMMARY'])
+        writer.writerow(['Total Gross Revenue (TSH)', f"{total_revenue:.2f}"])
+        writer.writerow(['Total Orders Completed', total_orders])
+        writer.writerow(['Average Order Value (TSH)', f"{avg_order_value:.2f}"])
+        writer.writerow(['Cash Sales (TSH)', f"{cash_sales:.2f}"])
+        writer.writerow(['Mobile Money Sales (TSH)', f"{mobile_sales:.2f}"])
+        writer.writerow(['Customer Credit Sales (TSH)', f"{credit_sales:.2f}"])
+        writer.writerow(['Customer Debt Recovered (TSH)', f"{debt_recovered:.2f}"])
+        writer.writerow(['Expected Cash in Drawer (TSH)', f"{(cash_sales + debt_recovered):.2f}"])
+        writer.writerow(['COGS (TSH)', f"{cogs:.2f}"])
+        writer.writerow(['Gross Profit (TSH)', f"{gross_profit:.2f}"])
+        writer.writerow(['Gross Margin', f"{gross_margin:.1f}%"])
+        writer.writerow([])
+
+        writer.writerow(['PACK VS SINGLE SALE RATIO'])
+        writer.writerow(['Type', 'Units Sold', 'Revenue (TSH)'])
+        writer.writerow(['Whole Packs', f"{pack_sales_count:.0f}", f"{pack_sales_rev:.2f}"])
+        writer.writerow(['Single Pieces', f"{single_sales_count:.0f}", f"{single_sales_rev:.2f}"])
+        writer.writerow([])
+
+        writer.writerow(['DEBTORS AGING SUMMARY'])
+        writer.writerow(['Total Outstanding Customer Debt (TSH)', f"{total_debtors:.2f}"])
+        writer.writerow(['Active Debtors Count', active_debtors_count])
+        writer.writerow(['Current (0-30 days) (TSH)', f"{aging_0_30:.2f}"])
+        writer.writerow(['Aging (31-60 days) (TSH)', f"{aging_31_60:.2f}"])
+        writer.writerow(['Aging (61-90 days) (TSH)', f"{aging_61_90:.2f}"])
+        writer.writerow(['Aging (90+ days) (TSH)', f"{aging_90_plus:.2f}"])
+        writer.writerow([])
+
+        writer.writerow(['SUPPLIER PAYABLES OVERVIEW'])
+        writer.writerow(['Registered Suppliers Count', suppliers_count])
+        writer.writerow(['Purchase Orders Count', total_po_count])
+        writer.writerow(['Total PO Cost (TSH)', f"{total_po_cost:.2f}"])
+        writer.writerow(['Total Paid to Suppliers (TSH)', f"{total_paid_to_suppliers:.2f}"])
+        writer.writerow(['Outstanding Payables Owed (TSH)', f"{total_payables_outstanding:.2f}"])
+        writer.writerow([])
+
+        writer.writerow(['INVENTORY VALUATION'])
+        writer.writerow(['Catalog Items Count', len(stat_products)])
+        writer.writerow(['Inventory Valuation at Cost (TSH)', f"{val_at_cost:.2f}"])
+        writer.writerow(['Inventory Valuation at Retail (TSH)', f"{val_at_retail:.2f}"])
+        writer.writerow(['Potential Gross Profit (TSH)', f"{(val_at_retail - val_at_cost):.2f}"])
+        writer.writerow(['Low Stock Alert Items', low_stock_count])
+        writer.writerow(['Out of Stock Items', out_of_stock_count])
+        writer.writerow([])
+
+        writer.writerow(['PRODUCT SALES BREAKDOWN'])
+        writer.writerow(['Product Name', 'Sale Mode', 'Units Sold', 'Revenue (TSH)', 'COGS (TSH)', 'Gross Profit (TSH)', 'Margin %'])
+        for p in product_sales:
+            writer.writerow([
+                p['product__name'],
+                p['sale_type'],
+                p['total_quantity'],
+                p['total_revenue'],
+                p['total_cogs'],
+                p['line_profit'],
+                p['margin_percent']
+            ])
+
+        return response
 
     return Response({
         'business_unit': 'stationery',
-        'product_sales': list(product_sales),
-        'stock_on_hand': list(stock_on_hand),
+        'currency': 'TSH',
+        'generated_at': timezone.now().isoformat(),
         'end_of_day': {
             'total_revenue': str(total_revenue),
             'cash_sales': str(cash_sales),
@@ -974,5 +1438,210 @@ def stationery_reports_view(request):
             'debt_recovered': str(debt_recovered),
             'expected_cash_drawer': str(cash_sales + debt_recovered),
             'total_debtors_balance': str(total_debtors),
+            'total_orders': total_orders,
+            'avg_order_value': f"{avg_order_value:.2f}",
+            'pack_sales_rev': str(pack_sales_rev),
+            'pack_sales_count': int(pack_sales_count),
+            'single_sales_rev': str(single_sales_rev),
+            'single_sales_count': int(single_sales_count),
+            'cogs': str(cogs),
+            'gross_profit': str(gross_profit),
+            'gross_margin_percent': f"{gross_margin:.1f}%",
+        },
+        'debtors': {
+            'total_balance': str(total_debtors),
+            'active_debtors_count': active_debtors_count,
+            'aging_0_30': str(aging_0_30),
+            'aging_31_60': str(aging_31_60),
+            'aging_61_90': str(aging_61_90),
+            'aging_90_plus': str(aging_90_plus),
+            'top_debtors': top_debtors
+        },
+        'payables': {
+            'suppliers_count': suppliers_count,
+            'total_po_count': total_po_count,
+            'total_po_cost': str(total_po_cost),
+            'total_paid': str(total_paid_to_suppliers),
+            'outstanding_payables': str(total_payables_outstanding)
+        },
+        'inventory_valuation': {
+            'total_items': len(stat_products),
+            'valuation_at_cost': str(val_at_cost),
+            'valuation_at_retail': str(val_at_retail),
+            'potential_gross_profit': str(val_at_retail - val_at_cost),
+            'low_stock_count': low_stock_count,
+            'out_of_stock_count': out_of_stock_count,
+        },
+        'product_sales': product_sales,
+        'stock_on_hand': stock_on_hand,
+    })
+
+
+@api_view(['GET'])
+@permission_classes([permissions.IsAuthenticated])
+def consolidated_reports_view(request):
+    """
+    Consolidated Executive Report combining Bar & Lounge + Stationery & Retail:
+    - Group Revenue, Orders, and Gross Profit
+    - Share of Business %
+    - Total Cash Expected in Drawers
+    - Total Working Capital in Stock
+    - Receivables vs Payables & Net Working Capital Position
+    """
+    user = request.user
+    if user.role not in (User.ROLE_OWNER, User.ROLE_BAR_MANAGER, User.ROLE_STATIONERY_MANAGER):
+        raise Http404("Consolidated reports require Manager or Owner authorization.")
+
+    # 1. Bar Metrics
+    bar_orders = Order.objects.filter(business_unit_id='bar', status=Order.STATUS_COMPLETED)
+    bar_revenue = bar_orders.aggregate(t=Sum('final_amount'))['t'] or Decimal('0.00')
+    bar_orders_count = bar_orders.count()
+    bar_items = OrderItem.objects.filter(order__business_unit_id='bar', order__status=Order.STATUS_COMPLETED).select_related('product')
+    bar_cogs = Decimal('0.00')
+    for itm in bar_items:
+        bar_cogs += itm.product.cost_price * itm.quantity
+    bar_profit = bar_revenue - bar_cogs
+    bar_margin = ((bar_profit / bar_revenue) * 100) if bar_revenue > 0 else Decimal('0.00')
+
+    bar_payments = Payment.objects.filter(order__business_unit_id='bar', order__status=Order.STATUS_COMPLETED)
+    bar_cash = bar_payments.filter(payment_method='CASH').aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
+    bar_momo = bar_payments.filter(payment_method='MOBILE_MONEY').aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
+
+    bar_stock = Product.objects.filter(business_unit_id='bar', is_active=True)
+    bar_stock_cost = Decimal('0.00')
+    bar_stock_retail = Decimal('0.00')
+    for bp in bar_stock:
+        bar_stock_cost += bp.stock_quantity * bp.cost_price
+        bar_stock_retail += bp.stock_quantity * bp.selling_price
+
+    # 2. Stationery Metrics
+    stat_orders = Order.objects.filter(business_unit_id='stationery', status=Order.STATUS_COMPLETED)
+    stat_revenue = stat_orders.aggregate(t=Sum('final_amount'))['t'] or Decimal('0.00')
+    stat_orders_count = stat_orders.count()
+    stat_items = OrderItem.objects.filter(order__business_unit_id='stationery', order__status=Order.STATUS_COMPLETED).select_related('product')
+    stat_cogs = Decimal('0.00')
+    for itm in stat_items:
+        p = itm.product
+        if p.is_pack and not itm.is_pack_sale and p.allow_split_sale:
+            stat_cogs += (p.cost_price / Decimal(p.pack_unit_ratio)) * itm.quantity
+        else:
+            stat_cogs += p.cost_price * itm.quantity
+    stat_profit = stat_revenue - stat_cogs
+    stat_margin = ((stat_profit / stat_revenue) * 100) if stat_revenue > 0 else Decimal('0.00')
+
+    stat_payments = Payment.objects.filter(order__business_unit_id='stationery', order__status=Order.STATUS_COMPLETED)
+    stat_cash = stat_payments.filter(payment_method='CASH').aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
+    stat_momo = stat_payments.filter(payment_method='MOBILE_MONEY').aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
+    stat_credit = stat_payments.filter(payment_method='CREDIT').aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
+    stat_debt_rec = CustomerCreditTransaction.objects.filter(
+        business_unit_id='stationery', transaction_type='PAYMENT_RECEIVED'
+    ).aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
+    stat_drawer_cash = stat_cash + stat_debt_rec
+
+    stat_stock = Product.objects.filter(business_unit_id='stationery', is_active=True)
+    stat_stock_cost = Decimal('0.00')
+    stat_stock_retail = Decimal('0.00')
+    for sp in stat_stock:
+        stat_stock_cost += sp.stock_quantity * sp.cost_price
+        stat_stock_retail += sp.stock_quantity * sp.selling_price
+
+    # Receivables & Payables
+    total_receivables = Customer.objects.filter(business_unit_id='stationery', is_active=True).aggregate(t=Sum('current_balance'))['t'] or Decimal('0.00')
+    pos = PurchaseOrder.objects.filter(business_unit_id='stationery')
+    total_po_cost = pos.aggregate(t=Sum('total_cost'))['t'] or Decimal('0.00')
+    total_po_paid = SupplierPayment.objects.filter(purchase_order__business_unit_id='stationery').aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
+    total_payables = max(Decimal('0.00'), total_po_cost - total_po_paid)
+
+    # Combined Group Totals
+    group_revenue = bar_revenue + stat_revenue
+    group_cogs = bar_cogs + stat_cogs
+    group_profit = bar_profit + stat_profit
+    group_margin = ((group_profit / group_revenue) * 100) if group_revenue > 0 else Decimal('0.00')
+    group_drawer_cash = bar_cash + stat_drawer_cash
+    group_inventory_cost = bar_stock_cost + stat_stock_cost
+    group_inventory_retail = bar_stock_retail + stat_stock_retail
+
+    bar_share = ((bar_revenue / group_revenue) * 100) if group_revenue > 0 else Decimal('0.00')
+    stat_share = ((stat_revenue / group_revenue) * 100) if group_revenue > 0 else Decimal('0.00')
+
+    net_working_capital = (group_drawer_cash + total_receivables + group_inventory_cost) - total_payables
+
+    if request.query_params.get('export') == 'csv':
+        response = HttpResponse(content_type='text/csv; charset=utf-8')
+        response['Content-Disposition'] = f'attachment; filename="fringe_consolidated_report_{timezone.now().strftime("%Y%m%d_%H%M")}.csv"'
+        writer = csv.writer(response)
+
+        writer.writerow(['THE FRINGE ENTERPRISES - CONSOLIDATED EXECUTIVE REPORT'])
+        writer.writerow(['Generated At', timezone.now().strftime('%Y-%m-%d %H:%M:%S'), 'Currency', 'TSH'])
+        writer.writerow([])
+
+        writer.writerow(['GROUP EXECUTIVE SUMMARY'])
+        writer.writerow(['Total Group Revenue (TSH)', f"{group_revenue:.2f}"])
+        writer.writerow(['Total Cost of Goods Sold (COGS) (TSH)', f"{group_cogs:.2f}"])
+        writer.writerow(['Total Gross Profit (TSH)', f"{group_profit:.2f}"])
+        writer.writerow(['Group Gross Margin', f"{group_margin:.1f}%"])
+        writer.writerow(['Total Drawer Cash (TSH)', f"{group_drawer_cash:.2f}"])
+        writer.writerow(['Working Capital in Inventory (TSH)', f"{group_inventory_cost:.2f}"])
+        writer.writerow(['Accounts Receivable (Customer Debt) (TSH)', f"{total_receivables:.2f}"])
+        writer.writerow(['Accounts Payable (Owed to Suppliers) (TSH)', f"{total_payables:.2f}"])
+        writer.writerow(['Net Working Capital Position (TSH)', f"{net_working_capital:.2f}"])
+        writer.writerow([])
+
+        writer.writerow(['BUSINESS UNIT BREAKDOWN'])
+        writer.writerow(['Unit', 'Revenue (TSH)', 'Share of Business', 'Orders', 'COGS (TSH)', 'Gross Profit (TSH)', 'Margin %', 'Drawer Cash (TSH)', 'Stock Valuation at Cost (TSH)'])
+        writer.writerow(['Bar & Lounge', f"{bar_revenue:.2f}", f"{bar_share:.1f}%", bar_orders_count, f"{bar_cogs:.2f}", f"{bar_profit:.2f}", f"{bar_margin:.1f}%", f"{bar_cash:.2f}", f"{bar_stock_cost:.2f}"])
+        writer.writerow(['Stationery & Retail', f"{stat_revenue:.2f}", f"{stat_share:.1f}%", stat_orders_count, f"{stat_cogs:.2f}", f"{stat_profit:.2f}", f"{stat_margin:.1f}%", f"{stat_drawer_cash:.2f}", f"{stat_stock_cost:.2f}"])
+        writer.writerow(['TOTAL GROUP', f"{group_revenue:.2f}", '100%', bar_orders_count + stat_orders_count, f"{group_cogs:.2f}", f"{group_profit:.2f}", f"{group_margin:.1f}%", f"{group_drawer_cash:.2f}", f"{group_inventory_cost:.2f}"])
+
+        return response
+
+    return Response({
+        'organization': 'The Fringe Enterprises Tanzania',
+        'currency': 'TSH',
+        'generated_at': timezone.now().isoformat(),
+        'group_summary': {
+            'group_revenue': str(group_revenue),
+            'group_cogs': str(group_cogs),
+            'group_profit': str(group_profit),
+            'group_margin_percent': f"{group_margin:.1f}%",
+            'group_drawer_cash': str(group_drawer_cash),
+            'group_inventory_cost': str(group_inventory_cost),
+            'group_inventory_retail': str(group_inventory_retail),
+            'total_receivables': str(total_receivables),
+            'total_payables': str(total_payables),
+            'net_working_capital': str(net_working_capital),
+        },
+        'units': {
+            'bar': {
+                'name': 'Bar & Lounge',
+                'revenue': str(bar_revenue),
+                'share_percent': f"{bar_share:.1f}%",
+                'orders_count': bar_orders_count,
+                'cogs': str(bar_cogs),
+                'gross_profit': str(bar_profit),
+                'gross_margin_percent': f"{bar_margin:.1f}%",
+                'cash_in_drawer': str(bar_cash),
+                'mobile_money': str(bar_momo),
+                'inventory_cost': str(bar_stock_cost),
+                'inventory_retail': str(bar_stock_retail)
+            },
+            'stationery': {
+                'name': 'Stationery & Retail',
+                'revenue': str(stat_revenue),
+                'share_percent': f"{stat_share:.1f}%",
+                'orders_count': stat_orders_count,
+                'cogs': str(stat_cogs),
+                'gross_profit': str(stat_profit),
+                'gross_margin_percent': f"{stat_margin:.1f}%",
+                'cash_in_drawer': str(stat_drawer_cash),
+                'cash_sales': str(stat_cash),
+                'mobile_money': str(stat_momo),
+                'credit_sales': str(stat_credit),
+                'debt_recovered': str(stat_debt_rec),
+                'receivables_owed': str(total_receivables),
+                'payables_owed': str(total_payables),
+                'inventory_cost': str(stat_stock_cost),
+                'inventory_retail': str(stat_stock_retail)
+            }
         }
     })

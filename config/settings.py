@@ -164,11 +164,18 @@ REST_FRAMEWORK = {
 
 
 # CORS configuration
+from corsheaders.defaults import default_headers
+
 cors_origins_env = os.getenv(
     'CORS_ALLOWED_ORIGINS',
-    'http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000'
+    'http://localhost:5173,http://127.0.0.1:5173,http://localhost:3000,http://127.0.0.1:3000'
 )
 CORS_ALLOWED_ORIGINS = [
     origin.strip() for origin in cors_origins_env.split(',') if origin.strip()
 ]
+CORS_ALLOW_ALL_ORIGINS = True  # Allows local network POS terminals and dev clients
 CORS_ALLOW_CREDENTIALS = True
+
+CORS_ALLOW_HEADERS = list(default_headers) + [
+    'x-business-unit',
+]

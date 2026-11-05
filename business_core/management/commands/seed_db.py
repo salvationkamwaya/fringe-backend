@@ -16,9 +16,9 @@ class Command(BaseCommand):
             defaults={
                 'name': 'Fringe Lounge & Bar',
                 'code': 'BAR',
-                'currency': 'ZMW',
+                'currency': 'TSH',
                 'settings': {
-                    'receipt_header': 'Fringe Lounge & Bar\nPlot 104, Great East Road, Lusaka\nTel: +260 971 000 111',
+                    'receipt_header': 'Fringe Lounge & Bar\nPlot 104, Mlimani City Road, Dar es Salaam\nTel: +255 754 000 111',
                     'receipt_footer': 'Thank you for drinking responsibly!\nNo sale of alcohol to persons under 18.',
                     'min_age_check': 18,
                     'allow_credit': False
@@ -31,12 +31,12 @@ class Command(BaseCommand):
             defaults={
                 'name': 'Fringe Stationery & Retail',
                 'code': 'STAT',
-                'currency': 'ZMW',
+                'currency': 'TSH',
                 'settings': {
-                    'receipt_header': 'Fringe Stationery & Printing Services\nPlot 104, Great East Road, Lusaka\nTel: +260 971 000 222',
+                    'receipt_header': 'Fringe Stationery & Printing Services\nPlot 104, Mlimani City Road, Dar es Salaam\nTel: +255 754 000 222',
                     'receipt_footer': 'Quality stationery for office & school.\nAll returns require original receipt.',
                     'allow_credit': True,
-                    'default_credit_limit': 1500.00
+                    'default_credit_limit': 150000.00
                 }
             }
         )

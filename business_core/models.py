@@ -12,7 +12,7 @@ class BusinessUnit(models.Model):
     id = models.CharField(max_length=20, primary_key=True)  # 'bar', 'stationery'
     name = models.CharField(max_length=100)
     code = models.CharField(max_length=10, unique=True)
-    currency = models.CharField(max_length=10, default='ZMW')
+    currency = models.CharField(max_length=10, default='TSH')
     settings = models.JSONField(default=dict, blank=True, encoder=DjangoJSONEncoder)
     is_active = models.BooleanField(default=True)
     created_at = models.DateTimeField(auto_now_add=True)
@@ -103,6 +103,22 @@ class User(AbstractUser):
     @property
     def is_stationery_manager_or_owner(self) -> bool:
         return self.role in (self.ROLE_OWNER, self.ROLE_STATIONERY_MANAGER)
+
+    @property
+    def can_record_sales(self) -> bool:
+        """
+        Only frontline cashiers/bartenders may ring up sales.
+        Managers and Business Owners perform oversight, inventory, reporting, and approvals.
+        """
+        return self.role in (self.ROLE_BARTENDER, self.ROLE_STATIONERY_CASHIER)
+
+    @property
+    def is_frontline_cashier(self) -> bool:
+        return self.role in (self.ROLE_BARTENDER, self.ROLE_STATIONERY_CASHIER)
+
+    @property
+    def is_management(self) -> bool:
+        return self.role in (self.ROLE_OWNER, self.ROLE_BAR_MANAGER, self.ROLE_STATIONERY_MANAGER)
 
     def __str__(self):
         unit = self.business_unit_id or 'All Units'

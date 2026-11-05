@@ -102,7 +102,7 @@ class Customer(TenantModel):
         return max(Decimal('0.00'), limit - balance)
 
     def __str__(self):
-        return f"{self.name} (Balance: ZMW {self.current_balance})"
+        return f"{self.name} (Balance: TSH {self.current_balance})"
 
 
 class Order(TenantModel):
@@ -244,7 +244,7 @@ class CustomerCreditTransaction(TenantModel):
         ordering = ['-created_at']
 
     def __str__(self):
-        return f"[{self.transaction_type}] {self.customer.name}: ZMW {self.amount}"
+        return f"[{self.transaction_type}] {self.customer.name}: TSH {self.amount}"
 
 
 class Supplier(TenantModel):
@@ -263,7 +263,7 @@ class Supplier(TenantModel):
         ordering = ['name']
 
     def __str__(self):
-        return f"{self.name} (Payable: ZMW {self.balance_payable})"
+        return f"{self.name} (Payable: TSH {self.balance_payable})"
 
 
 class PurchaseOrder(TenantModel):
@@ -298,7 +298,7 @@ class PurchaseOrder(TenantModel):
         return max(Decimal('0.00'), cost - paid)
 
     def __str__(self):
-        return f"PO #{self.order_number} - {self.supplier.name} (ZMW {self.total_cost})"
+        return f"PO #{self.order_number} - {self.supplier.name} (TSH {self.total_cost})"
 
 
 class SupplierPayment(TenantModel):
@@ -319,4 +319,4 @@ class SupplierPayment(TenantModel):
         ordering = ['-created_at']
 
     def __str__(self):
-        return f"Supplier Payment: ZMW {self.amount} to {self.supplier.name}"
+        return f"Supplier Payment: TSH {self.amount} to {self.supplier.name}"

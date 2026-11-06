@@ -4,6 +4,7 @@ from .models import Category, Product
 
 class CategorySerializer(serializers.ModelSerializer):
     product_count = serializers.IntegerField(source='products.count', read_only=True)
+    slug = serializers.SlugField(required=False, allow_blank=True)
 
     class Meta:
         model = Category
@@ -11,7 +12,7 @@ class CategorySerializer(serializers.ModelSerializer):
             'id', 'business_unit', 'name', 'slug', 'icon',
             'display_order', 'product_count', 'created_at'
         ]
-        read_only_fields = ['id', 'created_at']
+        read_only_fields = ['id', 'business_unit', 'created_at']
 
 
 class ProductSerializer(serializers.ModelSerializer):
@@ -32,4 +33,4 @@ class ProductSerializer(serializers.ModelSerializer):
             'allow_split_sale', 'split_unit_price',
             'created_at', 'updated_at'
         ]
-        read_only_fields = ['id', 'created_at', 'updated_at']
+        read_only_fields = ['id', 'business_unit', 'created_at', 'updated_at']

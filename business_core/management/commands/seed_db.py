@@ -43,7 +43,7 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS("[OK] Business Units seeded: Bar and Stationery"))
 
         # 2. Seed Users
-        # Owner (Dr. Mitu)
+        # Business Owner
         owner, created = User.objects.get_or_create(
             username='owner',
             defaults={

@@ -1,7 +1,7 @@
 import uuid
 import csv
 from decimal import Decimal
-from datetime import timedelta
+from datetime import datetime, date, time, timedelta
 from django.db import transaction
 from django.utils import timezone
 from django.db.models import Sum, Count, F, Q
@@ -9,6 +9,7 @@ from django.http import Http404, HttpResponse
 from rest_framework import viewsets, permissions, status
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.response import Response
+from rest_framework.pagination import PageNumberPagination
 
 from .models import (
     Shift, BarTab, Customer, Order, OrderItem, Payment,
@@ -19,6 +20,7 @@ from .serializers import (
     OrderSerializer, CustomerCreditTransactionSerializer,
     SupplierSerializer, PurchaseOrderSerializer, SupplierPaymentSerializer
 )
+from .pdf_generator import ReportPDFBuilder
 from business_catalog.models import Product
 from business_core.audit import record_audit
 from business_core.models import User
@@ -54,7 +56,7 @@ class ShiftViewSet(viewsets.ModelViewSet):
                 status=Shift.STATUS_OPEN
             ).values(
                 'id', 'cashier__username', 'cashier__first_name', 'cashier__last_name',
-                'opening_float', 'total_sales_cash', 'total_sales_mobile', 'opened_at'
+                'opening_float', 'total_sales_cash', 'total_sales_mobile', 'started_at'
             ))
             return Response({
                 'active_shift': ShiftSerializer(shift).data if shift else None,
@@ -218,6 +220,111 @@ class BarTabViewSet(viewsets.ModelViewSet):
             entity_id=tab.id,
             after_value={'tab_name': tab.tab_name, 'customer_name': tab.customer_name}
         )
+
+    @action(detail=True, methods=['post'])
+    def close_tab(self, request, pk=None):
+        tab = self.get_object()
+        if tab.status == BarTab.STATUS_CLOSED:
+            return Response({'error': 'Tab is already closed.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        tab.status = BarTab.STATUS_CLOSED
+        tab.closed_by = request.user
+        tab.closed_at = timezone.now()
+        tab.save()
+
+        record_audit(
+            request=request,
+            action='TAB_CLOSED',
+            entity_type='BarTab',
+            entity_id=tab.id,
+            metadata={'closed_by': request.user.username}
+        )
+        return Response({
+            'message': f"Tab '{tab.tab_name}' successfully closed.",
+            'tab': BarTabSerializer(tab).data
+        })
+
+    @action(detail=True, methods=['post'])
+    @transaction.atomic
+    def settle(self, request, pk=None):
+        tab = self.get_object()
+        if tab.status == BarTab.STATUS_CLOSED:
+            return Response({'error': 'Tab is already closed.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        unvoided_orders = tab.orders.exclude(status=Order.STATUS_VOIDED)
+        total_tab_amount = sum(order.final_amount for order in unvoided_orders)
+
+        existing_paid = Payment.objects.filter(order__in=unvoided_orders).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+        balance_due = max(Decimal('0.00'), total_tab_amount - existing_paid)
+
+        payments_data = request.data.get('payments', [])
+        if not payments_data and balance_due > Decimal('0.00'):
+            return Response({'error': 'Payment information is required to settle the tab.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        total_paid_incoming = Decimal('0.00')
+        parsed_payments = []
+        for p in payments_data:
+            method = p.get('payment_method', 'CASH').upper()
+            amt = Decimal(str(p.get('amount', '0.00')))
+            ref = p.get('reference', '')
+
+            if method not in ('CASH', 'MOBILE_MONEY'):
+                return Response({'error': 'Bar tabs accept Cash or Mobile Money only.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            if amt <= Decimal('0.00'):
+                return Response({'error': 'Payment amount must be greater than zero.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            total_paid_incoming += amt
+            parsed_payments.append({'method': method, 'amount': amt, 'reference': ref})
+
+        if balance_due > Decimal('0.00') and total_paid_incoming < balance_due:
+            return Response({
+                'error': f"Total paid (TSH {total_paid_incoming}) is less than tab balance due (TSH {balance_due})."
+            }, status=status.HTTP_400_BAD_REQUEST)
+
+        # Attach payments to latest order if orders exist
+        target_order = unvoided_orders.last()
+        shift = Shift.objects.filter(
+            business_unit_id='bar', cashier=request.user, status=Shift.STATUS_OPEN
+        ).first()
+
+        if target_order and parsed_payments:
+            for p in parsed_payments:
+                Payment.objects.create(
+                    order=target_order,
+                    payment_method=p['method'],
+                    amount=p['amount'],
+                    reference=p['reference']
+                )
+                if shift:
+                    if p['method'] == 'CASH':
+                        shift.total_sales_cash = F('total_sales_cash') + p['amount']
+                    elif p['method'] == 'MOBILE_MONEY':
+                        shift.total_sales_mobile = F('total_sales_mobile') + p['amount']
+
+            if shift:
+                shift.save(update_fields=['total_sales_cash', 'total_sales_mobile'])
+
+        tab.status = BarTab.STATUS_CLOSED
+        tab.closed_by = request.user
+        tab.closed_at = timezone.now()
+        tab.save()
+
+        record_audit(
+            request=request,
+            action='TAB_SETTLED',
+            entity_type='BarTab',
+            entity_id=tab.id,
+            after_value={'settled_amount': str(total_tab_amount), 'payments': parsed_payments},
+            metadata={'settled_by': request.user.username, 'tab_name': tab.tab_name}
+        )
+
+        return Response({
+            'message': f"Tab '{tab.tab_name}' successfully settled and closed!",
+            'tab': BarTabSerializer(tab).data,
+            'settled_amount': str(total_tab_amount),
+            'payments': parsed_payments
+        })
 
     @action(detail=True, methods=['post'])
     def reopen(self, request, pk=None):
@@ -554,19 +661,184 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
         })
 
 
+class OrderPagination(PageNumberPagination):
+    page_size = 15
+    page_size_query_param = 'page_size'
+    max_page_size = 100
+
+    def get_paginated_response(self, data):
+        return Response({
+            'count': self.page.paginator.count,
+            'total_pages': self.page.paginator.num_pages,
+            'current_page': self.page.number,
+            'page_size': self.get_page_size(self.request),
+            'next': self.get_next_link(),
+            'previous': self.get_previous_link(),
+            'results': data
+        })
+
+
 class OrderViewSet(viewsets.ModelViewSet):
     """
-    POS Order Processing:
-    - Supports Bar and Stationery.
+    POS Order Processing and Sales History Records:
+    - Supports Bar and Stationery with strict tenant isolation.
     - Automatic Unit vs Pack conversion for Stationery.
     - Customer Credit authorization for registered stationery customers.
     - Non-bypassable alcohol age check for Bar.
+    - Filterable by cashier/bartender, drink/product type, date range, payment method.
+    - Paginated with newest transactions first.
     """
     serializer_class = OrderSerializer
     permission_classes = [permissions.IsAuthenticated]
+    pagination_class = OrderPagination
 
     def get_queryset(self):
-        return Order.objects.for_request(self.request)
+        qs = Order.objects.for_request(self.request).select_related(
+            'cashier', 'shift', 'tab', 'customer'
+        ).prefetch_related('items__product', 'payments').order_by('-created_at')
+
+        user = self.request.user
+        params = self.request.query_params
+
+        # Filter by Cashier / Bartender
+        my_sales = params.get('my_sales')
+        cashier = params.get('cashier') or params.get('cashier_id')
+        if my_sales in ('true', '1'):
+            qs = qs.filter(cashier=user)
+        elif cashier:
+            if str(cashier).isdigit():
+                qs = qs.filter(cashier_id=int(cashier))
+            else:
+                qs = qs.filter(cashier__username__iexact=str(cashier))
+
+        # Filter by Shift
+        shift_id = params.get('shift') or params.get('shift_id')
+        if shift_id:
+            qs = qs.filter(shift_id=shift_id)
+
+        # Filter by Date Range (today, this_week, this_month, last_month, this_year, last_year, custom)
+        range_param = params.get('range')
+        start_date_param = params.get('start_date')
+        end_date_param = params.get('end_date')
+        if range_param or (start_date_param and end_date_param):
+            start, end, label, range_type, s_str, e_str = parse_date_range(self.request)
+            if start and end and range_type != 'all':
+                qs = qs.filter(created_at__range=(start, end))
+
+        # Filter by Drink / Product Category
+        category_id = params.get('category') or params.get('category_id')
+        if category_id:
+            qs = qs.filter(items__product__category_id=category_id)
+
+        # Filter by Specific Product
+        product_id = params.get('product') or params.get('product_id')
+        if product_id:
+            qs = qs.filter(items__product_id=product_id)
+
+        # Filter by Product Name
+        product_name = params.get('product_name')
+        if product_name:
+            qs = qs.filter(items__product_name__icontains=product_name)
+
+        # Filter by Alcoholic Drinks
+        is_alcoholic = params.get('is_alcoholic')
+        if is_alcoholic in ('true', '1'):
+            qs = qs.filter(items__is_alcoholic=True)
+
+        # Filter by Payment Method
+        payment_method = params.get('payment_method')
+        if payment_method:
+            qs = qs.filter(payments__payment_method=payment_method.upper())
+
+        # Filter by Order Status
+        status_filter = params.get('status')
+        if status_filter:
+            qs = qs.filter(status=status_filter.upper())
+
+        # General Search (Order #, Customer, Tab, Cashier, Item Name)
+        search = params.get('search')
+        if search:
+            search = search.strip()
+            qs = qs.filter(
+                Q(order_number__icontains=search) |
+                Q(customer__name__icontains=search) |
+                Q(tab__tab_name__icontains=search) |
+                Q(cashier__username__icontains=search) |
+                Q(cashier__first_name__icontains=search) |
+                Q(cashier__last_name__icontains=search) |
+                Q(items__product_name__icontains=search)
+            )
+
+        return qs.distinct()
+
+    def list(self, request, *args, **kwargs):
+        queryset = self.filter_queryset(self.get_queryset())
+
+        # Summary calculations across the entire filtered set (not just current page)
+        completed_qs = queryset.filter(status=Order.STATUS_COMPLETED)
+        aggregates = completed_qs.aggregate(
+            total_sales=Sum('final_amount'),
+            total_orders=Count('id', distinct=True)
+        )
+
+        cash_total = Payment.objects.filter(
+            order__in=completed_qs, payment_method=Payment.METHOD_CASH
+        ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+
+        mobile_total = Payment.objects.filter(
+            order__in=completed_qs, payment_method=Payment.METHOD_MOBILE_MONEY
+        ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+
+        credit_total = Payment.objects.filter(
+            order__in=completed_qs, payment_method=Payment.METHOD_CREDIT
+        ).aggregate(total=Sum('amount'))['total'] or Decimal('0.00')
+
+        summary = {
+            'total_sales': str(aggregates['total_sales'] or Decimal('0.00')),
+            'total_orders': aggregates['total_orders'] or 0,
+            'cash_total': str(cash_total),
+            'mobile_total': str(mobile_total),
+            'credit_total': str(credit_total),
+            'currency': 'TSH'
+        }
+
+        page = self.paginate_queryset(queryset)
+        if page is not None:
+            serializer = self.get_serializer(page, many=True)
+            response = self.get_paginated_response(serializer.data)
+            response.data['summary'] = summary
+            return response
+
+        serializer = self.get_serializer(queryset, many=True)
+        return Response({'results': serializer.data, 'summary': summary})
+
+    @action(detail=False, methods=['get'])
+    def filter_options(self, request):
+        """
+        Returns dynamic dropdown lists for sales record filtering:
+        - Staff / Cashiers / Bartenders who have recorded sales
+        - Categories (Drink classes / Stationery types)
+        """
+        unit_id = getattr(request, 'business_unit', request.user.business_unit_id)
+        if unit_id == 'all' or not unit_id:
+            unit_id = request.user.business_unit_id or 'bar'
+
+        cashiers = User.objects.filter(
+            orders__business_unit_id=unit_id
+        ).distinct().values('id', 'username', 'first_name', 'last_name', 'role')
+
+        from business_catalog.models import Category
+        categories = Category.objects.filter(
+            business_unit_id=unit_id
+        ).values('id', 'name', 'slug')
+
+        return Response({
+            'cashiers': list(cashiers),
+            'categories': list(categories),
+            'current_user_id': request.user.id,
+            'current_username': request.user.username,
+            'can_record_sales': request.user.can_record_sales
+        })
 
     @transaction.atomic
     def create(self, request, *args, **kwargs):
@@ -924,6 +1196,76 @@ class OrderViewSet(viewsets.ModelViewSet):
         return Response({'message': f"Order #{order.order_number} has been voided and stock restored.", 'order': OrderSerializer(order).data})
 
 
+def parse_date_range(request):
+    """
+    Parses 'range', 'start_date', 'end_date' query parameters.
+    Returns:
+        (start_datetime, end_datetime, range_label, range_type, start_date_str, end_date_str)
+    """
+    range_type = request.query_params.get('range', 'all').lower()
+    start_str = request.query_params.get('start_date')
+    end_str = request.query_params.get('end_date')
+    now = timezone.now()
+    today = now.date()
+
+    if range_type == 'today':
+        start = timezone.make_aware(datetime.combine(today, time.min))
+        end = timezone.make_aware(datetime.combine(today, time.max))
+        label = f"Today ({today.strftime('%d %b %Y')})"
+        s_str, e_str = today.isoformat(), today.isoformat()
+    elif range_type == 'this_week':
+        monday = today - timedelta(days=today.weekday())
+        start = timezone.make_aware(datetime.combine(monday, time.min))
+        end = now
+        label = f"This Week ({monday.strftime('%d %b')} - {today.strftime('%d %b %Y')})"
+        s_str, e_str = monday.isoformat(), today.isoformat()
+    elif range_type == 'this_month':
+        first_day = today.replace(day=1)
+        start = timezone.make_aware(datetime.combine(first_day, time.min))
+        end = now
+        label = f"This Month ({first_day.strftime('%B %Y')})"
+        s_str, e_str = first_day.isoformat(), today.isoformat()
+    elif range_type == 'last_month':
+        first_of_this_month = today.replace(day=1)
+        last_day_last_month = first_of_this_month - timedelta(days=1)
+        first_day_last_month = last_day_last_month.replace(day=1)
+        start = timezone.make_aware(datetime.combine(first_day_last_month, time.min))
+        end = timezone.make_aware(datetime.combine(last_day_last_month, time.max))
+        label = f"Last Month ({first_day_last_month.strftime('%B %Y')})"
+        s_str, e_str = first_day_last_month.isoformat(), last_day_last_month.isoformat()
+    elif range_type == 'this_year':
+        first_day = today.replace(month=1, day=1)
+        start = timezone.make_aware(datetime.combine(first_day, time.min))
+        end = now
+        label = f"This Year ({today.year})"
+        s_str, e_str = first_day.isoformat(), today.isoformat()
+    elif range_type == 'last_year':
+        last_year = today.year - 1
+        first_day = date(last_year, 1, 1)
+        last_day = date(last_year, 12, 31)
+        start = timezone.make_aware(datetime.combine(first_day, time.min))
+        end = timezone.make_aware(datetime.combine(last_day, time.max))
+        label = f"Last Year ({last_year})"
+        s_str, e_str = first_day.isoformat(), last_day.isoformat()
+    elif range_type == 'custom' or (start_str and end_str):
+        range_type = 'custom'
+        try:
+            s_date = datetime.strptime(start_str, '%Y-%m-%d').date() if start_str else today
+            e_date = datetime.strptime(end_str, '%Y-%m-%d').date() if end_str else today
+            if s_date > e_date:
+                s_date, e_date = e_date, s_date
+            start = timezone.make_aware(datetime.combine(s_date, time.min))
+            end = timezone.make_aware(datetime.combine(e_date, time.max))
+            label = f"Custom ({s_date.strftime('%d %b %Y')} to {e_date.strftime('%d %b %Y')})"
+            s_str, e_str = s_date.isoformat(), e_date.isoformat()
+        except ValueError:
+            start, end, label, range_type, s_str, e_str = None, None, "All Time", "all", None, None
+    else:
+        start, end, label, range_type, s_str, e_str = None, None, "All Time", "all", None, None
+
+    return start, end, label, range_type, s_str, e_str
+
+
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def bar_reports_view(request):
@@ -931,13 +1273,21 @@ def bar_reports_view(request):
     if unit_id not in ('bar', 'all') and request.user.role != User.ROLE_OWNER:
         raise Http404("Report not found.")
 
+    start_dt, end_dt, range_label, range_type, s_str, e_str = parse_date_range(request)
+
     completed_orders = Order.objects.filter(business_unit_id='bar', status=Order.STATUS_COMPLETED)
+    if start_dt and end_dt:
+        completed_orders = completed_orders.filter(created_at__range=(start_dt, end_dt))
+
     total_revenue = completed_orders.aggregate(total=Sum('final_amount'))['total'] or Decimal('0.00')
     total_orders = completed_orders.count()
     avg_order_value = (total_revenue / total_orders) if total_orders > 0 else Decimal('0.00')
 
     # Payments breakdown
     payments = Payment.objects.filter(order__business_unit_id='bar', order__status=Order.STATUS_COMPLETED)
+    if start_dt and end_dt:
+        payments = payments.filter(order__created_at__range=(start_dt, end_dt))
+
     cash_payments = payments.filter(payment_method='CASH')
     momo_payments = payments.filter(payment_method='MOBILE_MONEY')
     cash_total = cash_payments.aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
@@ -946,7 +1296,11 @@ def bar_reports_view(request):
     momo_count = momo_payments.count()
 
     # Product Sales breakdown
-    items = OrderItem.objects.filter(order__business_unit_id='bar', order__status=Order.STATUS_COMPLETED).select_related('product')
+    items = OrderItem.objects.filter(order__business_unit_id='bar', order__status=Order.STATUS_COMPLETED)
+    if start_dt and end_dt:
+        items = items.filter(order__created_at__range=(start_dt, end_dt))
+    items = items.select_related('product')
+
     total_drinks_sold = Decimal('0.00')
     alcoholic_revenue = Decimal('0.00')
     alcoholic_count = Decimal('0.00')
@@ -1048,8 +1402,11 @@ def bar_reports_view(request):
     stock_on_hand.sort(key=lambda x: Decimal(x['stock_quantity']))
 
     # Recent Shifts
+    shifts_query = Shift.objects.filter(business_unit_id='bar')
+    if start_dt and end_dt:
+        shifts_query = shifts_query.filter(started_at__range=(start_dt, end_dt))
     recent_shifts = []
-    for s in Shift.objects.filter(business_unit_id='bar').select_related('cashier').order_by('-started_at')[:10]:
+    for s in shifts_query.select_related('cashier').order_by('-started_at')[:10]:
         recent_shifts.append({
             'id': s.id,
             'cashier': s.cashier.username,
@@ -1064,17 +1421,93 @@ def bar_reports_view(request):
             'status': s.status
         })
 
+    # PDF Download Check
+    if request.query_params.get('export') == 'pdf':
+        pdf = ReportPDFBuilder(
+            title="Bar Management & Financial Report",
+            subtitle="The Fringe Bar & Lounge",
+            date_range_label=range_label,
+            business_unit="Bar & Lounge"
+        )
+        
+        pdf.add_kpi_grid([
+            {'label': 'Total Revenue', 'value': f"TSH {total_revenue:,.2f}", 'sub': f"{total_orders} completed orders", 'color': (0.85, 0.55, 0.05)},
+            {'label': 'Cost of Goods (COGS)', 'value': f"TSH {cogs:,.2f}", 'sub': 'Drink purchase costs', 'color': (0.4, 0.45, 0.55)},
+            {'label': 'Gross Profit', 'value': f"TSH {gross_profit:,.2f}", 'sub': f"Margin: {gross_margin:.1f}%", 'color': (0.08, 0.6, 0.35)},
+            {'label': 'Drinks Sold', 'value': f"{int(total_drinks_sold)} units", 'sub': f"Avg: TSH {avg_order_value:,.2f}", 'color': (0.1, 0.4, 0.8)},
+        ])
+
+        pdf.add_section_header("Payment Tenders & Category Breakdown")
+        tender_rows = [
+            ['Cash Collections', f"{cash_count} transactions", f"TSH {cash_total:,.2f}", f"{(cash_total/total_revenue*100):.1f}%" if total_revenue > 0 else '0%'],
+            ['Mobile Money (M-Pesa / Airtel)', f"{momo_count} transactions", f"TSH {momo_total:,.2f}", f"{(momo_total/total_revenue*100):.1f}%" if total_revenue > 0 else '0%'],
+            ['Alcoholic Beverages (18+ Statutory)', f"{int(alcoholic_count)} drinks", f"TSH {alcoholic_revenue:,.2f}", f"{(alcoholic_revenue/total_revenue*100):.1f}%" if total_revenue > 0 else '0%'],
+            ['Non-Alcoholic Soft Drinks', f"{int(non_alcoholic_count)} drinks", f"TSH {non_alcoholic_revenue:,.2f}", f"{(non_alcoholic_revenue/total_revenue*100):.1f}%" if total_revenue > 0 else '0%'],
+        ]
+        pdf.add_table(
+            headers=['Tender / Product Category', 'Volume / Transactions', 'Amount (TSH)', 'Share %'],
+            rows=tender_rows,
+            col_widths=[215, 120, 110, 70],
+            alignments=['L', 'L', 'R', 'R']
+        )
+
+        pdf.add_section_header("Product Sales Performance Breakdown")
+        prod_rows = []
+        for p in product_sales:
+            prod_rows.append([
+                p['product__name'],
+                '18+ Alcohol' if p['product__is_alcoholic'] else 'Soft Drink',
+                str(p['total_quantity']),
+                f"TSH {Decimal(p['unit_price']):,.2f}",
+                f"TSH {Decimal(p['total_revenue']):,.2f}",
+                f"TSH {Decimal(p['line_profit']):,.2f}",
+                p['margin_percent']
+            ])
+        pdf.add_table(
+            headers=['Product Name', 'Classification', 'Units', 'Price', 'Revenue', 'Profit', 'Margin'],
+            rows=prod_rows,
+            col_widths=[145, 75, 45, 65, 70, 65, 50],
+            alignments=['L', 'L', 'R', 'R', 'R', 'R', 'R']
+        )
+
+        pdf.add_section_header("Stock Valuation & Inventory Status")
+        stock_rows = []
+        for s in stock_on_hand:
+            stock_rows.append([
+                s['name'],
+                str(Decimal(s['stock_quantity'])),
+                str(Decimal(s['reorder_threshold'])),
+                f"TSH {Decimal(s['cost_price']):,.2f}",
+                f"TSH {Decimal(s['selling_price']):,.2f}",
+                f"TSH {Decimal(s['valuation_cost']):,.2f}",
+                s['status']
+            ])
+        pdf.add_table(
+            headers=['Product Name', 'Stock Qty', 'Reorder', 'Cost Price', 'Retail Price', 'Value at Cost', 'Status'],
+            rows=stock_rows,
+            col_widths=[150, 55, 50, 65, 65, 75, 55],
+            alignments=['L', 'R', 'R', 'R', 'R', 'R', 'L']
+        )
+
+        pdf_bytes = pdf.build()
+        response = HttpResponse(pdf_bytes, content_type='application/pdf')
+        filename = f"bar_report_{range_type}_{timezone.now().strftime('%Y%m%d_%H%M')}.pdf"
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
+
     # CSV Download Check
     if request.query_params.get('export') == 'csv':
         response = HttpResponse(content_type='text/csv; charset=utf-8')
-        response['Content-Disposition'] = f'attachment; filename="bar_comprehensive_report_{timezone.now().strftime("%Y%m%d_%H%M")}.csv"'
+        response['Content-Disposition'] = f'attachment; filename="bar_comprehensive_report_{range_type}_{timezone.now().strftime("%Y%m%d_%H%M")}.csv"'
         writer = csv.writer(response)
         
         writer.writerow(['THE FRINGE BAR & LOUNGE - COMPREHENSIVE BUSINESS REPORT'])
-        writer.writerow(['Generated At', timezone.now().strftime('%Y-%m-%d %H:%M:%S'), 'Currency', 'TSH'])
+        writer.writerow(['Report Period', range_label, 'Currency', 'TSH'])
+        writer.writerow(['Generated At', timezone.now().strftime('%Y-%m-%d %H:%M:%S')])
         writer.writerow([])
 
         writer.writerow(['EXECUTIVE FINANCIAL SUMMARY'])
+        writer.writerow(['Report Period', range_label])
         writer.writerow(['Total Revenue (TSH)', f"{total_revenue:.2f}"])
         writer.writerow(['Total Orders Completed', total_orders])
         writer.writerow(['Average Order Value (TSH)', f"{avg_order_value:.2f}"])
@@ -1135,6 +1568,12 @@ def bar_reports_view(request):
         'business_unit': 'bar',
         'currency': 'TSH',
         'generated_at': timezone.now().isoformat(),
+        'date_range': {
+            'range_type': range_type,
+            'label': range_label,
+            'start_date': s_str,
+            'end_date': e_str,
+        },
         'summary': {
             'total_revenue': str(total_revenue),
             'total_orders': total_orders,
@@ -1192,12 +1631,20 @@ def stationery_reports_view(request):
     if unit_id not in ('stationery', 'all') and request.user.role != User.ROLE_OWNER:
         raise Http404("Report not found.")
 
+    start_dt, end_dt, range_label, range_type, s_str, e_str = parse_date_range(request)
+
     completed = Order.objects.filter(business_unit_id='stationery', status=Order.STATUS_COMPLETED)
+    if start_dt and end_dt:
+        completed = completed.filter(created_at__range=(start_dt, end_dt))
+
     total_revenue = completed.aggregate(total=Sum('final_amount'))['total'] or Decimal('0.00')
     total_orders = completed.count()
     avg_order_value = (total_revenue / total_orders) if total_orders > 0 else Decimal('0.00')
 
     payments = Payment.objects.filter(order__business_unit_id='stationery', order__status=Order.STATUS_COMPLETED)
+    if start_dt and end_dt:
+        payments = payments.filter(order__created_at__range=(start_dt, end_dt))
+
     cash_sales = payments.filter(payment_method='CASH').aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
     cash_count = payments.filter(payment_method='CASH').count()
     mobile_sales = payments.filter(payment_method='MOBILE_MONEY').aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
@@ -1206,12 +1653,19 @@ def stationery_reports_view(request):
     credit_count = payments.filter(payment_method='CREDIT').count()
 
     # Recovered customer debts
-    debt_recovered = CustomerCreditTransaction.objects.filter(
+    debt_rec_query = CustomerCreditTransaction.objects.filter(
         business_unit_id='stationery', transaction_type='PAYMENT_RECEIVED'
-    ).aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
+    )
+    if start_dt and end_dt:
+        debt_rec_query = debt_rec_query.filter(created_at__range=(start_dt, end_dt))
+    debt_recovered = debt_rec_query.aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
 
     # Pack vs Single split & COGS
-    items = OrderItem.objects.filter(order__business_unit_id='stationery', order__status=Order.STATUS_COMPLETED).select_related('product')
+    items = OrderItem.objects.filter(order__business_unit_id='stationery', order__status=Order.STATUS_COMPLETED)
+    if start_dt and end_dt:
+        items = items.filter(order__created_at__range=(start_dt, end_dt))
+    items = items.select_related('product')
+
     cogs = Decimal('0.00')
     pack_sales_rev = Decimal('0.00')
     pack_sales_count = Decimal('0.00')
@@ -1355,17 +1809,106 @@ def stationery_reports_view(request):
         })
     stock_on_hand.sort(key=lambda x: Decimal(x['stock_quantity']))
 
+    # PDF Download Check
+    if request.query_params.get('export') == 'pdf':
+        pdf = ReportPDFBuilder(
+            title="Stationery & Retail Business Report",
+            subtitle="The Fringe Stationery & Retail",
+            date_range_label=range_label,
+            business_unit="Stationery & Retail"
+        )
+        
+        pdf.add_kpi_grid([
+            {'label': 'Total Revenue', 'value': f"TSH {total_revenue:,.2f}", 'sub': f"{total_orders} completed orders", 'color': (0.1, 0.5, 0.7)},
+            {'label': 'Expected Drawer Cash', 'value': f"TSH {(cash_sales + debt_recovered):,.2f}", 'sub': 'Cash + Recovered Debts', 'color': (0.1, 0.65, 0.35)},
+            {'label': 'Gross Profit', 'value': f"TSH {gross_profit:,.2f}", 'sub': f"Margin: {gross_margin:.1f}%", 'color': (0.05, 0.6, 0.3)},
+            {'label': 'Customer Debtors', 'value': f"TSH {total_debtors:,.2f}", 'sub': f"{active_debtors_count} active accounts", 'color': (0.8, 0.3, 0.2)},
+        ])
+
+        pdf.add_section_header("Financial Breakdown & Pack vs Single Split")
+        summary_rows = [
+            ['Cash Sales', f"TSH {cash_sales:,.2f}", 'Whole Pack Sales Revenue', f"TSH {pack_sales_rev:,.2f} ({int(pack_sales_count)} packs)"],
+            ['Mobile Money Sales', f"TSH {mobile_sales:,.2f}", 'Single Split Sales Revenue', f"TSH {single_sales_rev:,.2f} ({int(single_sales_count)} pieces)"],
+            ['Customer Credit Sales', f"TSH {credit_sales:,.2f}", 'Cost of Goods Sold (COGS)', f"TSH {cogs:,.2f}"],
+            ['Customer Debt Recoveries', f"TSH {debt_recovered:,.2f}", 'Gross Margin Percentage', f"{gross_margin:.1f}%"],
+        ]
+        pdf.add_table(
+            headers=['Payment Tender', 'Amount (TSH)', 'Product Split / Metric', 'Value / Details'],
+            rows=summary_rows,
+            col_widths=[130, 115, 140, 130],
+            alignments=['L', 'R', 'L', 'R']
+        )
+
+        pdf.add_section_header("Debtors Aging Breakdown (Customer Receivables)")
+        aging_rows = [
+            ['Current (0 - 30 days)', f"TSH {aging_0_30:,.2f}", 'Standard credit window'],
+            ['Overdue (31 - 60 days)', f"TSH {aging_31_60:,.2f}", 'Payment follow-up required'],
+            ['Overdue (61 - 90 days)', f"TSH {aging_61_90:,.2f}", 'Grace period expired'],
+            ['Critical Overdue (90+ days)', f"TSH {aging_90_plus:,.2f}", 'Urgent legal/management recovery'],
+        ]
+        pdf.add_table(
+            headers=['Aging Category', 'Outstanding Balance (TSH)', 'Recovery Status'],
+            rows=aging_rows,
+            col_widths=[180, 155, 180],
+            alignments=['L', 'R', 'L']
+        )
+
+        if top_debtors:
+            pdf.add_section_header("Top Customer Debt Accounts")
+            deb_rows = []
+            for d in top_debtors:
+                deb_rows.append([
+                    d['name'],
+                    d['phone'] or 'N/A',
+                    f"TSH {Decimal(d['credit_limit']):,.2f}",
+                    f"TSH {Decimal(d['available_credit']):,.2f}",
+                    f"TSH {Decimal(d['current_balance']):,.2f}"
+                ])
+            pdf.add_table(
+                headers=['Customer / School Name', 'Contact Phone', 'Credit Limit', 'Available', 'Owed Balance'],
+                rows=deb_rows,
+                col_widths=[165, 85, 90, 85, 90],
+                alignments=['L', 'L', 'R', 'R', 'R']
+            )
+
+        pdf.add_section_header("Product Sales Performance Breakdown")
+        prod_rows = []
+        for p in product_sales:
+            prod_rows.append([
+                p['product__name'],
+                p['sale_type'],
+                str(p['total_quantity']),
+                f"TSH {Decimal(p['total_revenue']):,.2f}",
+                f"TSH {Decimal(p['total_cogs']):,.2f}",
+                f"TSH {Decimal(p['line_profit']):,.2f}",
+                p['margin_percent']
+            ])
+        pdf.add_table(
+            headers=['Product Name', 'Sale Mode', 'Units', 'Revenue', 'COGS', 'Profit', 'Margin'],
+            rows=prod_rows,
+            col_widths=[165, 80, 45, 65, 60, 55, 45],
+            alignments=['L', 'L', 'R', 'R', 'R', 'R', 'R']
+        )
+
+        pdf_bytes = pdf.build()
+        response = HttpResponse(pdf_bytes, content_type='application/pdf')
+        filename = f"stationery_report_{range_type}_{timezone.now().strftime('%Y%m%d_%H%M')}.pdf"
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
+
     # CSV Download Check
     if request.query_params.get('export') == 'csv':
         response = HttpResponse(content_type='text/csv; charset=utf-8')
-        response['Content-Disposition'] = f'attachment; filename="stationery_comprehensive_report_{timezone.now().strftime("%Y%m%d_%H%M")}.csv"'
+        response['Content-Disposition'] = f'attachment; filename="stationery_comprehensive_report_{range_type}_{timezone.now().strftime("%Y%m%d_%H%M")}.csv"'
         writer = csv.writer(response)
 
         writer.writerow(['THE FRINGE STATIONERY & RETAIL - COMPREHENSIVE BUSINESS REPORT'])
-        writer.writerow(['Generated At', timezone.now().strftime('%Y-%m-%d %H:%M:%S'), 'Currency', 'TSH'])
+        writer.writerow(['Report Period', range_label, 'Currency', 'TSH'])
+        writer.writerow(['Generated At', timezone.now().strftime('%Y-%m-%d %H:%M:%S')])
         writer.writerow([])
 
         writer.writerow(['END-OF-DAY FINANCIAL SUMMARY'])
+        writer.writerow(['Report Period', range_label])
         writer.writerow(['Total Gross Revenue (TSH)', f"{total_revenue:.2f}"])
         writer.writerow(['Total Orders Completed', total_orders])
         writer.writerow(['Average Order Value (TSH)', f"{avg_order_value:.2f}"])
@@ -1430,6 +1973,12 @@ def stationery_reports_view(request):
         'business_unit': 'stationery',
         'currency': 'TSH',
         'generated_at': timezone.now().isoformat(),
+        'date_range': {
+            'range_type': range_type,
+            'label': range_label,
+            'start_date': s_str,
+            'end_date': e_str,
+        },
         'end_of_day': {
             'total_revenue': str(total_revenue),
             'cash_sales': str(cash_sales),
@@ -1492,11 +2041,21 @@ def consolidated_reports_view(request):
     if user.role not in (User.ROLE_OWNER, User.ROLE_BAR_MANAGER, User.ROLE_STATIONERY_MANAGER):
         raise Http404("Consolidated reports require Manager or Owner authorization.")
 
+    start_dt, end_dt, range_label, range_type, s_str, e_str = parse_date_range(request)
+
     # 1. Bar Metrics
     bar_orders = Order.objects.filter(business_unit_id='bar', status=Order.STATUS_COMPLETED)
+    if start_dt and end_dt:
+        bar_orders = bar_orders.filter(created_at__range=(start_dt, end_dt))
+
     bar_revenue = bar_orders.aggregate(t=Sum('final_amount'))['t'] or Decimal('0.00')
     bar_orders_count = bar_orders.count()
-    bar_items = OrderItem.objects.filter(order__business_unit_id='bar', order__status=Order.STATUS_COMPLETED).select_related('product')
+
+    bar_items = OrderItem.objects.filter(order__business_unit_id='bar', order__status=Order.STATUS_COMPLETED)
+    if start_dt and end_dt:
+        bar_items = bar_items.filter(order__created_at__range=(start_dt, end_dt))
+    bar_items = bar_items.select_related('product')
+
     bar_cogs = Decimal('0.00')
     for itm in bar_items:
         bar_cogs += itm.product.cost_price * itm.quantity
@@ -1504,6 +2063,9 @@ def consolidated_reports_view(request):
     bar_margin = ((bar_profit / bar_revenue) * 100) if bar_revenue > 0 else Decimal('0.00')
 
     bar_payments = Payment.objects.filter(order__business_unit_id='bar', order__status=Order.STATUS_COMPLETED)
+    if start_dt and end_dt:
+        bar_payments = bar_payments.filter(order__created_at__range=(start_dt, end_dt))
+
     bar_cash = bar_payments.filter(payment_method='CASH').aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
     bar_momo = bar_payments.filter(payment_method='MOBILE_MONEY').aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
 
@@ -1516,9 +2078,17 @@ def consolidated_reports_view(request):
 
     # 2. Stationery Metrics
     stat_orders = Order.objects.filter(business_unit_id='stationery', status=Order.STATUS_COMPLETED)
+    if start_dt and end_dt:
+        stat_orders = stat_orders.filter(created_at__range=(start_dt, end_dt))
+
     stat_revenue = stat_orders.aggregate(t=Sum('final_amount'))['t'] or Decimal('0.00')
     stat_orders_count = stat_orders.count()
-    stat_items = OrderItem.objects.filter(order__business_unit_id='stationery', order__status=Order.STATUS_COMPLETED).select_related('product')
+
+    stat_items = OrderItem.objects.filter(order__business_unit_id='stationery', order__status=Order.STATUS_COMPLETED)
+    if start_dt and end_dt:
+        stat_items = stat_items.filter(order__created_at__range=(start_dt, end_dt))
+    stat_items = stat_items.select_related('product')
+
     stat_cogs = Decimal('0.00')
     for itm in stat_items:
         p = itm.product
@@ -1530,12 +2100,19 @@ def consolidated_reports_view(request):
     stat_margin = ((stat_profit / stat_revenue) * 100) if stat_revenue > 0 else Decimal('0.00')
 
     stat_payments = Payment.objects.filter(order__business_unit_id='stationery', order__status=Order.STATUS_COMPLETED)
+    if start_dt and end_dt:
+        stat_payments = stat_payments.filter(order__created_at__range=(start_dt, end_dt))
+
     stat_cash = stat_payments.filter(payment_method='CASH').aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
     stat_momo = stat_payments.filter(payment_method='MOBILE_MONEY').aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
     stat_credit = stat_payments.filter(payment_method='CREDIT').aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
-    stat_debt_rec = CustomerCreditTransaction.objects.filter(
+
+    stat_debt_query = CustomerCreditTransaction.objects.filter(
         business_unit_id='stationery', transaction_type='PAYMENT_RECEIVED'
-    ).aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
+    )
+    if start_dt and end_dt:
+        stat_debt_query = stat_debt_query.filter(created_at__range=(start_dt, end_dt))
+    stat_debt_rec = stat_debt_query.aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
     stat_drawer_cash = stat_cash + stat_debt_rec
 
     stat_stock = Product.objects.filter(business_unit_id='stationery', is_active=True)
@@ -1566,16 +2143,67 @@ def consolidated_reports_view(request):
 
     net_working_capital = (group_drawer_cash + total_receivables + group_inventory_cost) - total_payables
 
+    # PDF Download Check
+    if request.query_params.get('export') == 'pdf':
+        pdf = ReportPDFBuilder(
+            title="Consolidated Executive Enterprise Report",
+            subtitle="The Fringe Enterprises (Bar & Lounge + Stationery)",
+            date_range_label=range_label,
+            business_unit="Consolidated (All Units)"
+        )
+        pdf.add_kpi_grid([
+            {'label': 'Group Revenue', 'value': f"TSH {group_revenue:,.2f}", 'sub': f"{bar_orders_count + stat_orders_count} total orders", 'color': (0.85, 0.55, 0.05)},
+            {'label': 'Group Gross Profit', 'value': f"TSH {group_profit:,.2f}", 'sub': f"Margin: {group_margin:.1f}%", 'color': (0.08, 0.6, 0.35)},
+            {'label': 'Total Drawer Cash', 'value': f"TSH {group_drawer_cash:,.2f}", 'sub': 'Bar + Stationery registers', 'color': (0.1, 0.55, 0.8)},
+            {'label': 'Net Working Capital', 'value': f"TSH {net_working_capital:,.2f}", 'sub': '(Cash+Debts+Stock)-Payables', 'color': (0.05, 0.5, 0.25)},
+        ])
+
+        pdf.add_section_header("Working Capital & Balance Sheet Snapshot")
+        wc_rows = [
+            ['Working Capital Tied in Inventory', f"TSH {group_inventory_cost:,.2f}", 'Bar + Stationery stock valued at cost price'],
+            ['Accounts Receivable (Customer Credit)', f"TSH {total_receivables:,.2f}", 'Debts owed by Stationery customers'],
+            ['Accounts Payable (Supplier Liabilities)', f"TSH {total_payables:,.2f}", 'Pending bills owed to stationery vendors'],
+            ['Total Register Cash', f"TSH {group_drawer_cash:,.2f}", 'Physical & mobile money in drawers'],
+            ['Net Working Capital Position', f"TSH {net_working_capital:,.2f}", '(Cash + Receivables + Stock) minus Payables'],
+        ]
+        pdf.add_table(
+            headers=['Balance Sheet Line Item', 'Amount (TSH)', 'Notes & Details'],
+            rows=wc_rows,
+            col_widths=[190, 135, 190],
+            alignments=['L', 'R', 'L']
+        )
+
+        pdf.add_section_header("Business Unit Performance Comparison")
+        comp_rows = [
+            ['Bar & Lounge', f"TSH {bar_revenue:,.2f}", f"{bar_share:.1f}%", str(bar_orders_count), f"TSH {bar_cogs:,.2f}", f"TSH {bar_profit:,.2f}", f"{bar_margin:.1f}%", f"TSH {bar_cash:,.2f}", f"TSH {bar_stock_cost:,.2f}"],
+            ['Stationery & Retail', f"TSH {stat_revenue:,.2f}", f"{stat_share:.1f}%", str(stat_orders_count), f"TSH {stat_cogs:,.2f}", f"TSH {stat_profit:,.2f}", f"{stat_margin:.1f}%", f"TSH {stat_drawer_cash:,.2f}", f"TSH {stat_stock_cost:,.2f}"],
+            ['Total Group', f"TSH {group_revenue:,.2f}", '100%', str(bar_orders_count + stat_orders_count), f"TSH {group_cogs:,.2f}", f"TSH {group_profit:,.2f}", f"{group_margin:.1f}%", f"TSH {group_drawer_cash:,.2f}", f"TSH {group_inventory_cost:,.2f}"],
+        ]
+        pdf.add_table(
+            headers=['Business Unit', 'Revenue', 'Share', 'Orders', 'COGS', 'Profit', 'Margin', 'Drawer Cash', 'Stock (Cost)'],
+            rows=comp_rows,
+            col_widths=[105, 65, 35, 35, 55, 55, 40, 65, 60],
+            alignments=['L', 'R', 'R', 'R', 'R', 'R', 'R', 'R', 'R']
+        )
+
+        pdf_bytes = pdf.build()
+        response = HttpResponse(pdf_bytes, content_type='application/pdf')
+        filename = f"fringe_consolidated_report_{range_type}_{timezone.now().strftime('%Y%m%d_%H%M')}.pdf"
+        response['Content-Disposition'] = f'attachment; filename="{filename}"'
+        return response
+
     if request.query_params.get('export') == 'csv':
         response = HttpResponse(content_type='text/csv; charset=utf-8')
-        response['Content-Disposition'] = f'attachment; filename="fringe_consolidated_report_{timezone.now().strftime("%Y%m%d_%H%M")}.csv"'
+        response['Content-Disposition'] = f'attachment; filename="fringe_consolidated_report_{range_type}_{timezone.now().strftime("%Y%m%d_%H%M")}.csv"'
         writer = csv.writer(response)
 
         writer.writerow(['THE FRINGE ENTERPRISES - CONSOLIDATED EXECUTIVE REPORT'])
-        writer.writerow(['Generated At', timezone.now().strftime('%Y-%m-%d %H:%M:%S'), 'Currency', 'TSH'])
+        writer.writerow(['Report Period', range_label, 'Currency', 'TSH'])
+        writer.writerow(['Generated At', timezone.now().strftime('%Y-%m-%d %H:%M:%S')])
         writer.writerow([])
 
         writer.writerow(['GROUP EXECUTIVE SUMMARY'])
+        writer.writerow(['Report Period', range_label])
         writer.writerow(['Total Group Revenue (TSH)', f"{group_revenue:.2f}"])
         writer.writerow(['Total Cost of Goods Sold (COGS) (TSH)', f"{group_cogs:.2f}"])
         writer.writerow(['Total Gross Profit (TSH)', f"{group_profit:.2f}"])
@@ -1599,6 +2227,12 @@ def consolidated_reports_view(request):
         'organization': 'The Fringe Enterprises Tanzania',
         'currency': 'TSH',
         'generated_at': timezone.now().isoformat(),
+        'date_range': {
+            'range_type': range_type,
+            'label': range_label,
+            'start_date': s_str,
+            'end_date': e_str,
+        },
         'group_summary': {
             'group_revenue': str(group_revenue),
             'group_cogs': str(group_cogs),

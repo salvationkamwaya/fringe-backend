@@ -61,35 +61,68 @@ class OrderSerializer(serializers.ModelSerializer):
     items = OrderItemSerializer(many=True, required=False)
     payments = PaymentSerializer(many=True, required=False)
     cashier_name = serializers.ReadOnlyField(source='cashier.username')
+    cashier_full_name = serializers.SerializerMethodField()
+    cashier_role = serializers.ReadOnlyField(source='cashier.role')
+    shift_id = serializers.ReadOnlyField(source='shift.id')
     tab_name = serializers.ReadOnlyField(source='tab.tab_name')
     customer_name = serializers.ReadOnlyField(source='customer.name')
+    item_summary = serializers.SerializerMethodField()
+    total_quantity = serializers.SerializerMethodField()
+    payment_methods = serializers.SerializerMethodField()
 
     class Meta:
         model = Order
         fields = [
-            'id', 'business_unit', 'order_number', 'shift', 'tab',
+            'id', 'business_unit', 'order_number', 'shift', 'shift_id', 'tab',
             'tab_name', 'customer', 'customer_name', 'cashier', 'cashier_name',
+            'cashier_full_name', 'cashier_role',
             'subtotal', 'discount_amount', 'discount_reason', 'discount_approved_by',
             'final_amount', 'status', 'void_reason', 'void_approved_by', 'voided_at',
             'is_age_verified', 'age_verified_by', 'age_verified_at',
-            'items', 'payments', 'created_at'
+            'items', 'payments', 'item_summary', 'total_quantity', 'payment_methods', 'created_at'
         ]
         read_only_fields = [
             'id', 'order_number', 'business_unit', 'cashier', 'created_at'
         ]
+
+    def get_cashier_full_name(self, obj):
+        if not obj.cashier:
+            return 'System'
+        full = f"{obj.cashier.first_name} {obj.cashier.last_name}".strip()
+        return full or f"@{obj.cashier.username}"
+
+    def get_item_summary(self, obj):
+        all_items = list(obj.items.all())
+        if not all_items:
+            return "No items"
+        items_preview = all_items[:2]
+        summary = ", ".join(f"{int(i.quantity) if i.quantity % 1 == 0 else i.quantity}x {i.product_name}" for i in items_preview)
+        if len(all_items) > 2:
+            summary += f" (+{len(all_items) - 2} more)"
+        return summary
+
+    def get_total_quantity(self, obj):
+        return sum(float(i.quantity) for i in obj.items.all())
+
+    def get_payment_methods(self, obj):
+        return list(set(p.payment_method for p in obj.payments.all()))
 
 
 class BarTabSerializer(serializers.ModelSerializer):
     opened_by_name = serializers.ReadOnlyField(source='opened_by.username')
     orders = OrderSerializer(many=True, read_only=True)
     total_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    total_paid = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    balance_due = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
+    items_count = serializers.IntegerField(read_only=True)
 
     class Meta:
         model = BarTab
         fields = [
             'id', 'business_unit', 'tab_name', 'customer_name',
             'status', 'opened_by', 'opened_by_name', 'closed_by',
-            'opened_at', 'closed_at', 'notes', 'total_amount', 'orders'
+            'opened_at', 'closed_at', 'notes', 'total_amount',
+            'total_paid', 'balance_due', 'items_count', 'orders'
         ]
         read_only_fields = ['id', 'business_unit', 'opened_by', 'opened_at']
 

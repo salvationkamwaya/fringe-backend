@@ -34,7 +34,7 @@ class User(AbstractUser):
     ROLE_STOCK_CLERK = 'stock_clerk'
 
     ROLE_CHOICES = [
-        (ROLE_OWNER, 'Owner (Dr. Mitu)'),
+        (ROLE_OWNER, 'Business Owner'),
         (ROLE_BAR_MANAGER, 'Bar Manager'),
         (ROLE_BARTENDER, 'Bartender / Cashier'),
         (ROLE_STATIONERY_MANAGER, 'Stationery Manager'),
@@ -118,6 +118,10 @@ class User(AbstractUser):
 
     @property
     def is_management(self) -> bool:
+        return self.role in (self.ROLE_OWNER, self.ROLE_BAR_MANAGER, self.ROLE_STATIONERY_MANAGER)
+
+    @property
+    def is_manager_or_owner(self) -> bool:
         return self.role in (self.ROLE_OWNER, self.ROLE_BAR_MANAGER, self.ROLE_STATIONERY_MANAGER)
 
     def __str__(self):

@@ -68,7 +68,27 @@ class BarTab(TenantModel):
 
     @property
     def total_amount(self):
-        return sum(order.final_amount for order in self.orders.filter(status='COMPLETED'))
+        return sum(order.final_amount for order in self.orders.exclude(status='VOIDED'))
+
+    @property
+    def total_paid(self):
+        return sum(
+            payment.amount
+            for order in self.orders.exclude(status='VOIDED')
+            for payment in order.payments.all()
+        )
+
+    @property
+    def balance_due(self):
+        return max(Decimal('0.00'), self.total_amount - self.total_paid)
+
+    @property
+    def items_count(self):
+        return sum(
+            item.quantity
+            for order in self.orders.exclude(status='VOIDED')
+            for item in order.items.all()
+        )
 
     def __str__(self):
         return f"Tab '{self.tab_name}' [{self.status}]"

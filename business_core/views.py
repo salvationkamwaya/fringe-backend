@@ -9,6 +9,12 @@ from .models import BusinessUnit, User, AuditLog
 from .serializers import BusinessUnitSerializer, UserSerializer, AuditLogSerializer, UserManagementSerializer
 from .audit import record_audit
 from .permissions import IsOwner, IsManagerOrOwner
+from .tokens import (
+    generate_owner_reset_token,
+    generate_self_service_code,
+    verify_and_consume_token,
+    validate_password_strength
+)
 
 
 @api_view(['POST'])
@@ -97,12 +103,20 @@ def me_view(request):
 def logout_view(request):
     """
     Invalidate the user's active session token and log event.
+    Supports audit tracking for manual logouts vs. automated idle timeout locks.
     """
+    reason = request.data.get('reason', 'manual')
+    action = 'USER_IDLE_LOGOUT' if reason == 'idle_timeout' else 'USER_LOGOUT'
+    metadata = {
+        'reason': 'Automated idle session timeout' if reason == 'idle_timeout' else 'Manual session sign-out'
+    }
+
     record_audit(
         request=request,
-        action='USER_LOGOUT',
+        action=action,
         entity_type='User',
-        entity_id=request.user.id
+        entity_id=request.user.id,
+        metadata=metadata
     )
     Token.objects.filter(user=request.user).delete()
     return Response({'message': 'Logged out successfully.'})
@@ -234,7 +248,7 @@ class UserManagementViewSet(viewsets.ModelViewSet):
     """
     Staff and Role management.
     NON-NEGOTIABLE ARCHITECTURAL RULE:
-    Strictly restricted to Business Owner (Dr. Mitu).
+    Strictly restricted to Business Owner.
     Only the Owner is authorized to create staff accounts, assign/change roles,
     configure approval PINs, or activate/suspend employee accounts.
     """
@@ -317,3 +331,276 @@ class UserManagementViewSet(viewsets.ModelViewSet):
             'message': f"Account {user.username} is now {'Active' if user.is_active else 'Suspended'}.",
             'is_active': user.is_active
         })
+
+    @action(detail=True, methods=['post'])
+    def generate_reset_token(self, request, pk=None):
+        """
+        Owner generates a temporary password reset token for an employee.
+        The employee uses this token to set a new password.
+        """
+        user = self.get_object()
+        token, expires_at = generate_owner_reset_token(user, generated_by_user=request.user)
+        return Response({
+            'message': f"Temporary reset token generated for @{user.username}.",
+            'username': user.username,
+            'token': token,
+            'expires_at': expires_at.isoformat()
+        })
+
+
+@api_view(['GET', 'PATCH'])
+@permission_classes([permissions.IsAuthenticated])
+def profile_view(request):
+    """
+    Get or update the current user's profile information.
+    """
+    user = request.user
+    if request.method == 'GET':
+        serializer = UserSerializer(user)
+        return Response(serializer.data)
+
+    elif request.method == 'PATCH':
+        first_name = request.data.get('first_name', user.first_name)
+        last_name = request.data.get('last_name', user.last_name)
+        email = request.data.get('email', user.email)
+
+        user.first_name = first_name
+        user.last_name = last_name
+        user.email = email
+        user.save(update_fields=['first_name', 'last_name', 'email'])
+
+        record_audit(
+            request=request,
+            action='USER_PROFILE_UPDATED',
+            entity_type='User',
+            entity_id=user.id,
+            after_value={'first_name': user.first_name, 'last_name': user.last_name, 'email': user.email}
+        )
+        return Response({
+            'message': 'Profile updated successfully.',
+            'user': UserSerializer(user).data
+        })
+
+
+@api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated])
+def change_password_view(request):
+    """
+    Update password for the logged-in user.
+    Requires current password verification and enforces strong password standards.
+    """
+    user = request.user
+    current_password = request.data.get('current_password')
+    new_password = request.data.get('new_password')
+    confirm_password = request.data.get('confirm_password')
+
+    if not current_password or not new_password or not confirm_password:
+        return Response({'error': 'Current password, new password, and confirmation are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not user.check_password(current_password):
+        return Response({'error': 'Current password does not match.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if new_password != confirm_password:
+        return Response({'error': 'New password and confirmation do not match.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if current_password == new_password:
+        return Response({'error': 'New password must be different from current password.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    is_valid, msg = validate_password_strength(new_password)
+    if not is_valid:
+        return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)
+
+    user.set_password(new_password)
+    user.save()
+
+    # Refresh auth token
+    Token.objects.filter(user=user).delete()
+    new_token = Token.objects.create(user=user)
+
+    record_audit(
+        request=request,
+        action='USER_PASSWORD_CHANGED',
+        entity_type='User',
+        entity_id=user.id
+    )
+
+    return Response({
+        'message': 'Password successfully changed and secured!',
+        'token': new_token.key
+    })
+
+
+@api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated])
+def change_pin_view(request):
+    """
+    Update authorization PIN for the logged-in manager or owner.
+    Verifies current password for authentication.
+    """
+    user = request.user
+    current_password = request.data.get('current_password')
+    pin = request.data.get('pin')
+    confirm_pin = request.data.get('confirm_pin')
+
+    if not current_password or not pin:
+        return Response({'error': 'Current password and new PIN are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not user.check_password(current_password):
+        return Response({'error': 'Current password verification failed.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if not str(pin).isdigit() or len(str(pin)) < 4 or len(str(pin)) > 6:
+        return Response({'error': 'PIN must be a 4 to 6 digit numeric code.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if confirm_pin and str(pin) != str(confirm_pin):
+        return Response({'error': 'PIN confirmation does not match.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    user.set_pin(str(pin))
+    user.save(update_fields=['pin_hash'])
+
+    record_audit(
+        request=request,
+        action='USER_PIN_CHANGED',
+        entity_type='User',
+        entity_id=user.id
+    )
+
+    return Response({'message': 'Authorization PIN successfully updated!'})
+
+
+@api_view(['POST'])
+@authentication_classes([])
+@permission_classes([permissions.AllowAny])
+def forgot_password_request_view(request):
+    """
+    Self-service step 1: User requests password reset by providing username or email.
+    Generates a secure 6-digit verification code.
+    """
+    identifier = request.data.get('identifier') or request.data.get('username') or request.data.get('email')
+    if not identifier:
+        return Response({'error': 'Please enter your username or registered email address.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    identifier_str = str(identifier).strip()
+    user = User.objects.filter(
+        Q(username__iexact=identifier_str) | Q(email__iexact=identifier_str)
+    ).first()
+
+    if not user:
+        return Response({'error': f"No account found matching '{identifier_str}'."}, status=status.HTTP_404_NOT_FOUND)
+
+    if not user.is_active:
+        return Response({'error': 'This account has been deactivated. Please contact the Business Owner.'}, status=status.HTTP_403_FORBIDDEN)
+
+    code, expires_at = generate_self_service_code(user)
+
+    # In production with SMTP, send via email. Here, we also return it for immediate verification.
+    return Response({
+        'message': f"Verification code generated for @{user.username}.",
+        'username': user.username,
+        'code': code,
+        'expires_at': expires_at.isoformat()
+    })
+
+
+@api_view(['POST'])
+@authentication_classes([])
+@permission_classes([permissions.AllowAny])
+def forgot_password_confirm_view(request):
+    """
+    Self-service step 2: User provides 6-digit verification code and sets new password.
+    """
+    identifier = request.data.get('identifier') or request.data.get('username')
+    code = request.data.get('code')
+    new_password = request.data.get('new_password')
+    confirm_password = request.data.get('confirm_password')
+
+    if not identifier or not code or not new_password:
+        return Response({'error': 'Username, verification code, and new password are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    identifier_str = str(identifier).strip()
+    user = User.objects.filter(
+        Q(username__iexact=identifier_str) | Q(email__iexact=identifier_str)
+    ).first()
+
+    if not user:
+        return Response({'error': 'Account not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    is_verified, msg = verify_and_consume_token(user, code, expected_type='self')
+    if not is_verified:
+        return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)
+
+    if new_password != confirm_password:
+        return Response({'error': 'New password and confirmation do not match.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    is_valid, pwd_msg = validate_password_strength(new_password)
+    if not is_valid:
+        return Response({'error': pwd_msg}, status=status.HTTP_400_BAD_REQUEST)
+
+    user.set_password(new_password)
+    user.save()
+
+    # Invalidate old tokens
+    Token.objects.filter(user=user).delete()
+
+    record_audit(
+        request=request,
+        user=user,
+        action='PASSWORD_RESET_SELF_SERVICE',
+        entity_type='User',
+        entity_id=user.id
+    )
+
+    return Response({'message': f"Password for @{user.username} has been successfully reset! You can now sign in."})
+
+
+@api_view(['POST'])
+@authentication_classes([])
+@permission_classes([permissions.AllowAny])
+def reset_password_with_token_view(request):
+    """
+    Owner-assisted reset: Employee enters username, the temporary token given by Business Owner,
+    and sets their new password.
+    """
+    username = request.data.get('username')
+    token = request.data.get('token')
+    new_password = request.data.get('new_password')
+    confirm_password = request.data.get('confirm_password')
+
+    if not username or not token or not new_password:
+        return Response({'error': 'Username, Owner Reset Token, and new password are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    username_str = str(username).strip()
+    user = User.objects.filter(
+        Q(username__iexact=username_str) | Q(email__iexact=username_str)
+    ).first()
+
+    if not user:
+        return Response({'error': f"User '@{username_str}' not found."}, status=status.HTTP_404_NOT_FOUND)
+
+    is_verified, msg = verify_and_consume_token(user, token, expected_type='owner')
+    if not is_verified:
+        return Response({'error': msg}, status=status.HTTP_400_BAD_REQUEST)
+
+    if new_password != confirm_password:
+        return Response({'error': 'New password and confirmation do not match.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    is_valid, pwd_msg = validate_password_strength(new_password)
+    if not is_valid:
+        return Response({'error': pwd_msg}, status=status.HTTP_400_BAD_REQUEST)
+
+    user.set_password(new_password)
+    user.save()
+
+    # Invalidate old auth tokens
+    Token.objects.filter(user=user).delete()
+
+    record_audit(
+        request=request,
+        user=user,
+        action='PASSWORD_RESET_VIA_OWNER_TOKEN',
+        entity_type='User',
+        entity_id=user.id,
+        metadata={'reset_by': 'Owner-Assisted Token'}
+    )
+
+    return Response({'message': f"Password for @{user.username} has been successfully updated using Owner Token! You can now sign in."})
+

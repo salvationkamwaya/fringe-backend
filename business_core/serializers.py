@@ -11,15 +11,16 @@ class BusinessUnitSerializer(serializers.ModelSerializer):
 class UserSerializer(serializers.ModelSerializer):
     has_pin = serializers.SerializerMethodField()
     business_unit_name = serializers.ReadOnlyField(source='business_unit.name')
+    role_display = serializers.CharField(source='get_role_display', read_only=True)
 
     class Meta:
         model = User
         fields = [
             'id', 'username', 'email', 'first_name', 'last_name',
-            'role', 'business_unit', 'business_unit_name', 'is_active',
+            'role', 'role_display', 'business_unit', 'business_unit_name', 'is_active',
             'has_pin', 'date_joined'
         ]
-        read_only_fields = ['id', 'has_pin', 'date_joined']
+        read_only_fields = ['id', 'has_pin', 'date_joined', 'role_display']
 
     def get_has_pin(self, obj) -> bool:
         return bool(obj.pin_hash)

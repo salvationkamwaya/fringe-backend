@@ -20,7 +20,7 @@ def run_rbac_and_isolation_tests():
     # 1. OWNER PRIVILEGE & STAFF CREATION / ROLE ASSIGNMENT
     # -------------------------------------------------------------
     print("\n--- 1. Testing Owner Authentication ---")
-    owner_login = client.post('/api/auth/login/', {'username': 'owner', 'password': 'password123'})
+    owner_login = client.post('/api/auth/login/', {'username': 'owner', 'password': 'Fringe@2026!'})
     assert owner_login.status_code == 200, f"Owner login failed: {owner_login.data}"
     owner_token = owner_login.data['token']
     client.credentials(HTTP_AUTHORIZATION=f'Token {owner_token}')

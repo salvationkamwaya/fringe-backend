@@ -21,9 +21,14 @@ from .serializers import (
     SupplierSerializer, PurchaseOrderSerializer, SupplierPaymentSerializer
 )
 from .pdf_generator import ReportPDFBuilder
-from business_catalog.models import Product
+from business_catalog.models import Product, Category
 from business_core.audit import record_audit
 from business_core.models import User
+from .stationery_store import (
+    list_expenses, add_expense, delete_expense,
+    list_quotations, get_quotation, create_quotation, update_quotation_status,
+    list_returns, create_return, EXPENSE_CATEGORIES
+)
 
 
 class ShiftViewSet(viewsets.ModelViewSet):
@@ -703,7 +708,10 @@ class OrderViewSet(viewsets.ModelViewSet):
         # Filter by Cashier / Bartender
         my_sales = params.get('my_sales')
         cashier = params.get('cashier') or params.get('cashier_id')
-        if my_sales in ('true', '1'):
+        if user.role in (User.ROLE_BARTENDER, User.ROLE_STATIONERY_CASHIER):
+            # Frontline staff can ONLY view sales they personally recorded
+            qs = qs.filter(cashier=user)
+        elif my_sales in ('true', '1'):
             qs = qs.filter(cashier=user)
         elif cashier:
             if str(cashier).isdigit():
@@ -823,9 +831,12 @@ class OrderViewSet(viewsets.ModelViewSet):
         if unit_id == 'all' or not unit_id:
             unit_id = request.user.business_unit_id or 'bar'
 
-        cashiers = User.objects.filter(
-            orders__business_unit_id=unit_id
-        ).distinct().values('id', 'username', 'first_name', 'last_name', 'role')
+        if request.user.role in (User.ROLE_BARTENDER, User.ROLE_STATIONERY_CASHIER):
+            cashiers = User.objects.filter(id=request.user.id).values('id', 'username', 'first_name', 'last_name', 'role')
+        else:
+            cashiers = User.objects.filter(
+                orders__business_unit_id=unit_id
+            ).distinct().values('id', 'username', 'first_name', 'last_name', 'role')
 
         from business_catalog.models import Category
         categories = Category.objects.filter(
@@ -876,15 +887,24 @@ class OrderViewSet(viewsets.ModelViewSet):
         discount_amount = Decimal(str(request.data.get('discount_amount', '0.00')))
         discount_reason = request.data.get('discount_reason', '')
         discount_approver_id = request.data.get('discount_approved_by')
+        order_type = request.data.get('order_type', 'RETAIL').upper()
+        quotation_id = request.data.get('quotation_id')
 
         if not items_data:
             return Response({'error': 'Order must contain at least one item.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # In Wholesale mode, customer is required (shops, schools, offices)
+        if unit_id == 'stationery' and order_type == 'WHOLESALE' and not customer_id:
+            return Response({
+                'error': 'Wholesale orders require selecting a registered customer (school, office, or retail shop).',
+                'code': 'WHOLESALE_CUSTOMER_REQUIRED'
+            }, status=status.HTTP_400_BAD_REQUEST)
 
         has_alcoholic_item = False
         parsed_items = []
         subtotal = Decimal('0.00')
 
-        # 1. PARSE ITEMS & HANDLE UNIT VS PACK PRICING
+        # 1. PARSE ITEMS & HANDLE UNIT VS PACK & WHOLESALE PRICING
         for item_data in items_data:
             product_id = item_data.get('product_id')
             qty = Decimal(str(item_data.get('quantity', 1)))
@@ -899,14 +919,34 @@ class OrderViewSet(viewsets.ModelViewSet):
                 has_alcoholic_item = True
 
             # Determine price and stock deduction ratio
-            if product.is_pack and not is_pack_sale and product.allow_split_sale:
-                # Sold as individual units/pieces
+            if order_type == 'WHOLESALE':
+                if item_data.get('unit_price'):
+                    line_price = Decimal(str(item_data['unit_price']))
+                elif product.is_pack and not is_pack_sale and product.allow_split_sale:
+                    base_split = product.split_unit_price or (product.selling_price / Decimal(product.pack_unit_ratio))
+                    line_price = (base_split * Decimal('0.85')).quantize(Decimal('0.01'))
+                else:
+                    line_price = (product.selling_price * Decimal('0.85')).quantize(Decimal('0.01'))
+
+                if product.is_pack and not is_pack_sale and product.allow_split_sale:
+                    stock_deduction = qty / Decimal(product.pack_unit_ratio)
+                else:
+                    stock_deduction = qty
+            elif product.is_pack and not is_pack_sale and product.allow_split_sale:
+                # Sold as individual units/pieces (Retail)
                 line_price = product.split_unit_price or (product.selling_price / Decimal(product.pack_unit_ratio))
                 stock_deduction = qty / Decimal(product.pack_unit_ratio)
             else:
-                # Sold as full pack or standard product
+                # Sold as full pack or standard product (Retail)
                 line_price = product.selling_price
                 stock_deduction = qty
+
+            # F4 Out-of-stock blockage check
+            if product.stock_quantity < stock_deduction and not request.data.get('allow_negative_stock', False):
+                return Response({
+                    'error': f"Product '{product.name}' is out of stock (Available: {product.stock_quantity}, Requested: {stock_deduction}).",
+                    'code': 'OUT_OF_STOCK'
+                }, status=status.HTTP_400_BAD_REQUEST)
 
             line_subtotal = line_price * qty
             subtotal += line_subtotal
@@ -1008,10 +1048,13 @@ class OrderViewSet(viewsets.ModelViewSet):
                 business_unit_id=unit_id, cashier=user, status=Shift.STATUS_OPEN
             ).first()
 
-        # 5. CREATE ORDER
+        # 5. CREATE ORDER (With Retail vs Wholesale identifier)
+        prefix = 'BAR' if unit_id == 'bar' else ('STN-WS' if order_type == 'WHOLESALE' else 'STN')
+        order_number = f"{prefix}-{timezone.now().strftime('%y%m%d%H%M')}-{uuid.uuid4().hex[:4].upper()}"
+
         order = Order.objects.create(
             business_unit_id=unit_id,
-            order_number=Order.generate_order_number(unit_id),
+            order_number=order_number,
             shift=shift,
             tab=tab,
             customer=customer,
@@ -1026,6 +1069,9 @@ class OrderViewSet(viewsets.ModelViewSet):
             age_verified_by=user if is_age_verified else None,
             age_verified_at=timezone.now() if is_age_verified else None,
         )
+
+        if quotation_id and unit_id == 'stationery':
+            update_quotation_status(quotation_id, 'CONVERTED', converted_order_number=order.order_number, unit_id='stationery')
 
         # 6. CREATE ORDER ITEMS & DEDUCT INVENTORY
         for p_item in parsed_items:
@@ -1728,6 +1774,18 @@ def stationery_reports_view(request):
     gross_profit = total_revenue - cogs
     gross_margin = ((gross_profit / total_revenue) * 100) if total_revenue > 0 else Decimal('0.00')
 
+    # Operating Expenses (F9) & Net Profit
+    expenses_list = list_expenses(unit_id='stationery', start_date=s_str, end_date=e_str)
+    total_expenses = sum(Decimal(str(e.get('amount', 0))) for e in expenses_list)
+    net_profit = gross_profit - total_expenses
+    net_margin = ((net_profit / total_revenue) * 100) if total_revenue > 0 else Decimal('0.00')
+
+    # Retail vs Wholesale Breakdown (F1.2 & F4 & F5)
+    wholesale_orders = completed.filter(order_number__contains='-WS-')
+    retail_orders = completed.exclude(order_number__contains='-WS-')
+    wholesale_rev = wholesale_orders.aggregate(t=Sum('final_amount'))['t'] or Decimal('0.00')
+    retail_rev = retail_orders.aggregate(t=Sum('final_amount'))['t'] or Decimal('0.00')
+
     # Debtors Aging
     now = timezone.now()
     active_customers = Customer.objects.filter(business_unit_id='stationery', is_active=True)
@@ -1996,6 +2054,22 @@ def stationery_reports_view(request):
             'cogs': str(cogs),
             'gross_profit': str(gross_profit),
             'gross_margin_percent': f"{gross_margin:.1f}%",
+            'total_expenses': str(total_expenses),
+            'net_profit': str(net_profit),
+            'net_margin_percent': f"{net_margin:.1f}%",
+            'retail_sales_rev': str(retail_rev),
+            'retail_sales_count': retail_orders.count(),
+            'wholesale_sales_rev': str(wholesale_rev),
+            'wholesale_sales_count': wholesale_orders.count(),
+        },
+        'expenses': {
+            'total_expenses': str(total_expenses),
+            'count': len(expenses_list),
+            'categories': {
+                cat: str(sum(Decimal(str(e.get('amount', 0))) for e in expenses_list if e.get('category') == cat))
+                for cat in EXPENSE_CATEGORIES if any(e.get('category') == cat for e in expenses_list)
+            },
+            'recent': expenses_list[:25]
         },
         'debtors': {
             'total_balance': str(total_debtors),
@@ -2279,3 +2353,320 @@ def consolidated_reports_view(request):
             }
         }
     })
+
+
+# ==========================================
+# EXPENSES API (F9)
+# ==========================================
+@api_view(['GET', 'POST'])
+@permission_classes([permissions.IsAuthenticated])
+def expenses_view(request):
+    """
+    Operating Expenses Management:
+    - Lists expenses with category, date range, and summary breakdown.
+    - Records operating costs (Rent, Transport, Electricity, Salaries, Repairs, etc.).
+    """
+    unit_id = getattr(request, 'business_unit', request.user.business_unit_id) or 'stationery'
+    
+    if request.method == 'GET':
+        start = request.query_params.get('start_date')
+        end = request.query_params.get('end_date')
+        cat = request.query_params.get('category')
+        expenses = list_expenses(unit_id=unit_id, start_date=start, end_date=end, category=cat)
+        total = sum(e.get('amount', 0) for e in expenses)
+        
+        category_totals = {}
+        for c in EXPENSE_CATEGORIES:
+            sub = sum(e.get('amount', 0) for e in expenses if e.get('category') == c)
+            if sub > 0:
+                category_totals[c] = sub
+                
+        return Response({
+            'results': expenses,
+            'count': len(expenses),
+            'total_amount': total,
+            'category_totals': category_totals,
+            'categories': EXPENSE_CATEGORIES
+        })
+
+    # POST: Record expense
+    if not request.user.is_stationery_manager_or_owner and request.user.role != User.ROLE_STOCK_CLERK:
+        return Response({
+            'error': 'Manager, Owner, or Stock Clerk privileges required to record expenses.'
+        }, status=status.HTTP_403_FORBIDDEN)
+
+    record = add_expense(request.data, request.user, unit_id=unit_id)
+    record_audit(
+        request=request,
+        action='EXPENSE_RECORDED',
+        entity_type='Expense',
+        entity_id=record['id'],
+        metadata={'category': record['category'], 'amount': str(record['amount'])}
+    )
+    return Response({
+        'message': f"Expense {record['id']} successfully recorded.",
+        'expense': record
+    }, status=status.HTTP_201_CREATED)
+
+
+@api_view(['DELETE'])
+@permission_classes([permissions.IsAuthenticated])
+def expense_detail_view(request, expense_id):
+    """Delete an expense (Manager/Owner only)"""
+    if not request.user.is_stationery_manager_or_owner:
+        return Response({'error': 'Only Managers and Business Owners can delete expenses.'}, status=status.HTTP_403_FORBIDDEN)
+    
+    unit_id = getattr(request, 'business_unit', request.user.business_unit_id) or 'stationery'
+    ok = delete_expense(expense_id, unit_id=unit_id)
+    if ok:
+        record_audit(request=request, action='EXPENSE_DELETED', entity_type='Expense', entity_id=expense_id)
+        return Response({'message': 'Expense deleted successfully.'})
+    return Response({'error': 'Expense record not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+
+# ==========================================
+# QUOTATIONS / PRICE OFFERS API (F5 & 4.4)
+# ==========================================
+@api_view(['GET', 'POST'])
+@permission_classes([permissions.IsAuthenticated])
+def quotations_view(request):
+    """
+    Quotations / Price Offers:
+    - Lists price offers for schools, offices, and retail shops.
+    - Creates formal quotation with validity period.
+    """
+    unit_id = getattr(request, 'business_unit', request.user.business_unit_id) or 'stationery'
+
+    if request.method == 'GET':
+        status_filter = request.query_params.get('status')
+        customer_id = request.query_params.get('customer')
+        quotes = list_quotations(unit_id=unit_id, status=status_filter, customer_id=customer_id)
+        return Response({'results': quotes, 'count': len(quotes)})
+
+    # POST: Create quotation
+    data = request.data
+    record = create_quotation(data, request.user, unit_id=unit_id)
+    record_audit(
+        request=request,
+        action='QUOTATION_CREATED',
+        entity_type='Quotation',
+        entity_id=record['id'],
+        metadata={'customer': record['customer_name'], 'final_amount': str(record['final_amount'])}
+    )
+    return Response({
+        'message': f"Quotation {record['quote_number']} created successfully.",
+        'quotation': record
+    }, status=status.HTTP_201_CREATED)
+
+
+@api_view(['GET', 'PATCH', 'POST'])
+@permission_classes([permissions.IsAuthenticated])
+def quotation_detail_view(request, quote_id):
+    """View details or update status of a quotation"""
+    unit_id = getattr(request, 'business_unit', request.user.business_unit_id) or 'stationery'
+    quote = get_quotation(quote_id, unit_id=unit_id)
+    if not quote:
+        return Response({'error': 'Quotation not found.'}, status=status.HTTP_404_NOT_FOUND)
+
+    if request.method == 'GET':
+        return Response(quote)
+
+    new_status = request.data.get('status', 'ACCEPTED').upper()
+    converted_order = request.data.get('converted_order_number')
+    updated = update_quotation_status(quote_id, new_status, converted_order_number=converted_order, unit_id=unit_id)
+    return Response({'message': f"Quotation status updated to {new_status}.", 'quotation': updated})
+
+
+# ==========================================
+# RETURNS & REFUNDS API (F8)
+# ==========================================
+@api_view(['GET', 'POST'])
+@permission_classes([permissions.IsAuthenticated])
+@transaction.atomic
+def returns_view(request):
+    """
+    Customer Returns & Damaged Goods Disposition:
+    - Return to stock or write-off as damaged.
+    - Refund in cash or credit customer account.
+    - Requires Manager PIN authorization.
+    """
+    unit_id = getattr(request, 'business_unit', request.user.business_unit_id) or 'stationery'
+
+    if request.method == 'GET':
+        returns_list = list_returns(unit_id=unit_id)
+        return Response({'results': returns_list, 'count': len(returns_list)})
+
+    # POST: Process return
+    pin = request.data.get('manager_pin')
+    approver = None
+    if pin:
+        managers = User.objects.filter(is_active=True).exclude(pin_hash__isnull=True).filter(
+            role__in=[User.ROLE_OWNER, User.ROLE_STATIONERY_MANAGER]
+        )
+        for m in managers:
+            if m.check_pin(pin):
+                approver = m
+                break
+
+    if not approver and not request.user.is_stationery_manager_or_owner:
+        return Response({
+            'error': 'Manager authorization PIN required to approve customer returns and refunds.',
+            'code': 'MANAGER_PIN_REQUIRED'
+        }, status=status.HTTP_403_FORBIDDEN)
+
+    items = request.data.get('items', [])
+    if not items:
+        return Response({'error': 'At least one return item is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    disposition = request.data.get('disposition', 'RETURN_TO_STOCK')
+    refund_method = request.data.get('refund_method', 'CASH').upper()
+    customer_id = request.data.get('customer_id')
+
+    total_refund = Decimal('0.00')
+
+    for itm in items:
+        prod_id = itm.get('product_id')
+        qty = Decimal(str(itm.get('quantity', 1)))
+        price = Decimal(str(itm.get('unit_price', 0)))
+        total_refund += price * qty
+
+        if disposition == 'RETURN_TO_STOCK' and prod_id:
+            try:
+                prod = Product.objects.select_for_update().get(id=prod_id, business_unit_id=unit_id)
+                is_pack = bool(itm.get('is_pack_sale', False))
+                if prod.is_pack and not is_pack and prod.allow_split_sale:
+                    stock_add = qty / Decimal(prod.pack_unit_ratio)
+                else:
+                    stock_add = qty
+                prod.stock_quantity = F('stock_quantity') + stock_add
+                prod.save(update_fields=['stock_quantity'])
+            except Product.DoesNotExist:
+                pass
+
+    if refund_method == 'CREDIT' and customer_id:
+        try:
+            cust = Customer.objects.select_for_update().get(id=customer_id, business_unit_id=unit_id)
+            balance_before = cust.current_balance
+            cust.current_balance = max(Decimal('0.00'), F('current_balance') - total_refund)
+            cust.save(update_fields=['current_balance'])
+            cust.refresh_from_db()
+
+            CustomerCreditTransaction.objects.create(
+                business_unit_id=unit_id,
+                customer=cust,
+                transaction_type=CustomerCreditTransaction.TYPE_ADJUSTMENT,
+                amount=total_refund,
+                balance_before=balance_before,
+                balance_after=cust.current_balance,
+                payment_method='CREDIT_NOTE',
+                recorded_by=request.user,
+                approved_by=approver or request.user,
+                notes=f"Customer return refund (Ref Order: {request.data.get('order_number', 'Sale')})"
+            )
+        except Customer.DoesNotExist:
+            pass
+
+    ret_record = create_return({
+        **request.data,
+        'approved_by_name': approver.username if approver else request.user.username
+    }, request.user, unit_id=unit_id)
+
+    record_audit(
+        request=request,
+        action='SALE_RETURN_PROCESSED',
+        entity_type='Return',
+        entity_id=ret_record['id'],
+        metadata={'total_refund': str(total_refund), 'disposition': disposition, 'method': refund_method}
+    )
+
+    return Response({
+        'message': f"Return {ret_record['return_number']} successfully processed.",
+        'return': ret_record
+    })
+
+
+# ==========================================
+# BULK PRODUCT IMPORT (F2)
+# ==========================================
+@api_view(['POST'])
+@permission_classes([permissions.IsAuthenticated])
+def product_bulk_import_view(request):
+    """
+    Import stationery products in bulk from CSV/Excel data.
+    """
+    if not request.user.is_stationery_manager_or_owner and request.user.role != User.ROLE_STOCK_CLERK:
+        return Response({
+            'error': 'Manager, Owner, or Stock Clerk privileges required to import catalog items.'
+        }, status=status.HTTP_403_FORBIDDEN)
+
+    products_data = request.data.get('products', [])
+    if not products_data:
+        return Response({'error': 'No product records provided for import.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    created_count = 0
+    updated_count = 0
+    errors = []
+
+    for idx, row in enumerate(products_data):
+        name = row.get('name', '').strip()
+        if not name:
+            errors.append(f"Row {idx+1}: Missing product name.")
+            continue
+
+        cat_name = row.get('category', '').strip()
+        cat = None
+        if cat_name:
+            cat, _ = Category.objects.get_or_create(
+                business_unit_id='stationery',
+                name=cat_name,
+                defaults={'slug': cat_name.lower().replace(' ', '-')}
+            )
+
+        sku = row.get('sku', '').strip()
+        barcode = row.get('barcode', '').strip()
+        desc = row.get('description', '').strip()
+        cost_price = Decimal(str(row.get('cost_price', '0.00') or '0.00'))
+        selling_price = Decimal(str(row.get('selling_price', '0.00') or '0.00'))
+        stock_qty = Decimal(str(row.get('stock_quantity', '0.00') or '0.00'))
+        threshold = Decimal(str(row.get('reorder_threshold', '5.00') or '5.00'))
+
+        is_pack = bool(row.get('is_pack', False))
+        ratio = int(row.get('pack_unit_ratio', 1) or 1)
+        pack_name = row.get('pack_name', 'Pack') or 'Pack'
+        unit_name = row.get('unit_name', 'Piece') or 'Piece'
+        allow_split = bool(row.get('allow_split_sale', False))
+        split_price = Decimal(str(row.get('split_unit_price', '0.00'))) if (allow_split and row.get('split_unit_price')) else None
+
+        prod, created = Product.objects.update_or_create(
+            business_unit_id='stationery',
+            name=name,
+            defaults={
+                'category': cat,
+                'sku': sku,
+                'barcode': barcode,
+                'description': desc,
+                'cost_price': cost_price,
+                'selling_price': selling_price,
+                'stock_quantity': stock_qty,
+                'reorder_threshold': threshold,
+                'is_pack': is_pack,
+                'pack_unit_ratio': ratio,
+                'pack_name': pack_name,
+                'unit_name': unit_name,
+                'allow_split_sale': allow_split,
+                'split_unit_price': split_price,
+                'is_active': True,
+            }
+        )
+        if created:
+            created_count += 1
+        else:
+            updated_count += 1
+
+    return Response({
+        'message': f"Import completed: {created_count} products added, {updated_count} updated.",
+        'created_count': created_count,
+        'updated_count': updated_count,
+        'errors': errors
+    })
+

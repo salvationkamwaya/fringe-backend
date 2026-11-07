@@ -1,0 +1,133 @@
+[
+  {
+    "id": "QUO-2611072020-675B",
+    "quote_number": "QUO-2611072020-675B",
+    "business_unit": "stationery",
+    "customer_id": null,
+    "customer_name": "Green Hills Academy",
+    "customer_contact": "",
+    "customer_address": "",
+    "customer_tin": "",
+    "items": [
+      {
+        "product_id": 1,
+        "product_name": "A4 Paper Carton",
+        "is_pack": true,
+        "pack_name": "Carton",
+        "unit_name": "Ream",
+        "quantity": 15,
+        "unit_price": 52000.0,
+        "subtotal": 780000.0
+      },
+      {
+        "product_id": 2,
+        "product_name": "Blue Ballpoint Pens Box",
+        "is_pack": true,
+        "pack_name": "Box",
+        "unit_name": "Piece",
+        "quantity": 20,
+        "unit_price": 15000.0,
+        "subtotal": 300000.0
+      }
+    ],
+    "subtotal": 1080000.0,
+    "discount_amount": 0.0,
+    "final_amount": 1080000.0,
+    "total_amount": 1080000.0,
+    "valid_until": null,
+    "status": "ACCEPTED",
+    "notes": "Free delivery to main campus",
+    "created_by": "cashier1",
+    "created_by_name": "John Doe",
+    "created_at": "2026-11-07T20:20:03.872567+00:00",
+    "converted_order_number": "stationery",
+    "converted_at": "2026-11-07T20:20:03.874583+00:00"
+  },
+  {
+    "id": "QUO-2611072019-B4C2",
+    "quote_number": "QUO-2611072019-B4C2",
+    "business_unit": "stationery",
+    "customer_id": null,
+    "customer_name": "Green Hills Academy",
+    "customer_contact": "",
+    "customer_address": "",
+    "customer_tin": "",
+    "items": [
+      {
+        "product_id": 1,
+        "product_name": "A4 Paper Carton",
+        "is_pack": true,
+        "pack_name": "Carton",
+        "unit_name": "Ream",
+        "quantity": 15,
+        "unit_price": 52000.0,
+        "subtotal": 780000.0
+      },
+      {
+        "product_id": 2,
+        "product_name": "Blue Ballpoint Pens Box",
+        "is_pack": true,
+        "pack_name": "Box",
+        "unit_name": "Piece",
+        "quantity": 20,
+        "unit_price": 15000.0,
+        "subtotal": 300000.0
+      }
+    ],
+    "subtotal": 1080000.0,
+    "discount_amount": 0.0,
+    "final_amount": 1080000.0,
+    "total_amount": 1080000.0,
+    "valid_until": null,
+    "status": "ACCEPTED",
+    "notes": "Free delivery to main campus",
+    "created_by": "cashier1",
+    "created_by_name": "John Doe",
+    "created_at": "2026-11-07T20:19:28.577278+00:00",
+    "converted_order_number": "stationery",
+    "converted_at": "2026-11-07T20:19:28.589943+00:00"
+  },
+  {
+    "id": "QUO-2611072018-BF65",
+    "quote_number": "QUO-2611072018-BF65",
+    "business_unit": "stationery",
+    "customer_id": null,
+    "customer_name": "Green Hills Academy",
+    "customer_contact": "",
+    "customer_address": "",
+    "customer_tin": "",
+    "items": [
+      {
+        "product_id": 1,
+        "product_name": "A4 Paper Carton",
+        "is_pack": true,
+        "pack_name": "Carton",
+        "unit_name": "Ream",
+        "quantity": 15,
+        "unit_price": 52000.0,
+        "subtotal": 780000.0
+      },
+      {
+        "product_id": 2,
+        "product_name": "Blue Ballpoint Pens Box",
+        "is_pack": true,
+        "pack_name": "Box",
+        "unit_name": "Piece",
+        "quantity": 20,
+        "unit_price": 15000.0,
+        "subtotal": 300000.0
+      }
+    ],
+    "subtotal": 1080000.0,
+    "discount_amount": 0.0,
+    "final_amount": 1080000.0,
+    "valid_until": null,
+    "status": "PENDING",
+    "notes": "Free delivery to main campus",
+    "created_by": "cashier1",
+    "created_by_name": "John Doe",
+    "created_at": "2026-11-07T20:18:59.599756+00:00",
+    "converted_order_number": null,
+    "converted_at": null
+  }
+]

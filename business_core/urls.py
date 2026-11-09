@@ -5,11 +5,12 @@ from .views import (
     profile_view, change_password_view, change_pin_view,
     forgot_password_request_view, forgot_password_confirm_view,
     reset_password_with_token_view,
-    BusinessUnitViewSet, AuditLogViewSet, UserManagementViewSet
+    BusinessUnitViewSet, AuditLogViewSet, UserManagementViewSet, BranchViewSet
 )
 
 router = DefaultRouter()
 router.register(r'business-units', BusinessUnitViewSet, basename='business-unit')
+router.register(r'branches', BranchViewSet, basename='branch')
 router.register(r'audit-logs', AuditLogViewSet, basename='audit-log')
 router.register(r'users', UserManagementViewSet, basename='user')
 

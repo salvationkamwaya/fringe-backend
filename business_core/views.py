@@ -5,8 +5,11 @@ from rest_framework.authtoken.models import Token
 from django.contrib.auth import authenticate
 from django.utils import timezone
 from django.db.models import Q
-from .models import BusinessUnit, User, AuditLog
-from .serializers import BusinessUnitSerializer, UserSerializer, AuditLogSerializer, UserManagementSerializer
+from .models import BusinessUnit, Branch, User, AuditLog
+from .serializers import (
+    BusinessUnitSerializer, BranchSerializer, UserSerializer,
+    AuditLogSerializer, UserManagementSerializer
+)
 from .audit import record_audit
 from .permissions import IsOwner, IsManagerOrOwner
 from .tokens import (
@@ -69,19 +72,27 @@ def login_view(request):
         metadata={'client': 'POS_WEB'}
     )
 
-    # Available business units
+    # Available business units and branches
     if user.role == User.ROLE_OWNER:
         units = list(BusinessUnit.objects.filter(is_active=True).values('id', 'name', 'code'))
+        branches = list(Branch.objects.filter(is_active=True).values('id', 'business_unit_id', 'name', 'code', 'address', 'phone'))
     else:
         units = list(BusinessUnit.objects.filter(id=user.business_unit_id).values('id', 'name', 'code'))
+        if user.branch_id:
+            branches = list(Branch.objects.filter(id=user.branch_id, is_active=True).values('id', 'business_unit_id', 'name', 'code', 'address', 'phone'))
+        else:
+            branches = []
 
     active_unit = user.business_unit_id if user.role != User.ROLE_OWNER else (request.headers.get('X-Business-Unit') or 'all')
+    active_branch = user.branch_id if user.role != User.ROLE_OWNER else (request.headers.get('X-Branch-Id') or 'all')
 
     return Response({
         'token': token.key,
         'user': UserSerializer(user).data,
         'active_unit': active_unit,
         'available_units': units,
+        'active_branch': active_branch,
+        'branches': branches,
     })
 
 
@@ -91,9 +102,12 @@ def me_view(request):
     """
     Get current user profile and session unit context.
     """
+    branches = list(Branch.objects.filter(is_active=True).values('id', 'business_unit_id', 'name', 'code', 'address', 'phone'))
     return Response({
         'user': UserSerializer(request.user).data,
         'active_unit': getattr(request, 'business_unit', request.user.business_unit_id or 'all'),
+        'active_branch': getattr(request, 'branch_id', getattr(request.user, 'branch_id', None)),
+        'branches': branches,
         'is_owner': request.user.is_owner,
     })
 
@@ -268,7 +282,8 @@ class UserManagementViewSet(viewsets.ModelViewSet):
             after_value={
                 'username': user.username,
                 'role': user.role,
-                'unit': user.business_unit_id
+                'unit': user.business_unit_id,
+                'branch': user.branch_id,
             },
             metadata={'created_by': 'Owner'}
         )
@@ -277,14 +292,16 @@ class UserManagementViewSet(viewsets.ModelViewSet):
         before = self.get_object()
         before_role = before.role
         before_unit = before.business_unit_id
+        before_branch = before.branch_id
         user = serializer.save()
+        action_name = 'STAFF_BRANCH_REASSIGNED' if before_branch != user.branch_id else 'STAFF_ROLE_ASSIGNED'
         record_audit(
             request=self.request,
-            action='STAFF_ROLE_ASSIGNED',
+            action=action_name,
             entity_type='User',
             entity_id=user.id,
-            before_value={'role': before_role, 'unit': before_unit},
-            after_value={'role': user.role, 'unit': user.business_unit_id},
+            before_value={'role': before_role, 'unit': before_unit, 'branch': before_branch},
+            after_value={'role': user.role, 'unit': user.business_unit_id, 'branch': user.branch_id},
             metadata={'updated_by': 'Owner'}
         )
 
@@ -603,4 +620,73 @@ def reset_password_with_token_view(request):
     )
 
     return Response({'message': f"Password for @{user.username} has been successfully updated using Owner Token! You can now sign in."})
+
+
+class BranchViewSet(viewsets.ModelViewSet):
+    """
+    CRUD for physical business branches dynamically managed by the Business Owner.
+    - Owner can create, edit, list, and deactivate branches.
+    - Frontline staff and managers can list active branches.
+    """
+    serializer_class = BranchSerializer
+    permission_classes = [permissions.IsAuthenticated]
+
+    def get_queryset(self):
+        qs = Branch.objects.all()
+        unit_id = getattr(self.request, 'business_unit', None)
+        if unit_id and unit_id != 'all':
+            qs = qs.filter(business_unit_id=unit_id)
+        if self.request.user.role != User.ROLE_OWNER:
+            qs = qs.filter(is_active=True)
+        return qs
+
+    def perform_create(self, serializer):
+        user = self.request.user
+        if user.role != User.ROLE_OWNER:
+            self.permission_denied(self.request, message="Only the Business Owner can register new branches.")
+
+        unit_id = self.request.data.get('business_unit') or getattr(self.request, 'business_unit', 'bar')
+        if unit_id == 'all' or not unit_id:
+            unit_id = 'bar'
+
+        branch = serializer.save(business_unit_id=unit_id)
+        record_audit(
+            request=self.request,
+            action='BRANCH_CREATED',
+            entity_type='Branch',
+            entity_id=branch.id,
+            after_value={'name': branch.name, 'code': branch.code, 'address': branch.address, 'business_unit': unit_id}
+        )
+
+    def perform_update(self, serializer):
+        user = self.request.user
+        if user.role != User.ROLE_OWNER:
+            self.permission_denied(self.request, message="Only the Business Owner can update branch settings.")
+
+        old_instance = self.get_object()
+        before_val = {'name': old_instance.name, 'code': old_instance.code, 'is_active': old_instance.is_active}
+        branch = serializer.save()
+        record_audit(
+            request=self.request,
+            action='BRANCH_UPDATED',
+            entity_type='Branch',
+            entity_id=branch.id,
+            before_value=before_val,
+            after_value={'name': branch.name, 'code': branch.code, 'is_active': branch.is_active}
+        )
+
+    @action(detail=True, methods=['post'])
+    def toggle_active(self, request, pk=None):
+        """Toggle active / deactivated status of a branch (Owner only)."""
+        if request.user.role != User.ROLE_OWNER:
+            return Response({'error': 'Only the Business Owner can deactivate branches.'}, status=status.HTTP_403_FORBIDDEN)
+        branch = self.get_object()
+        branch.is_active = not branch.is_active
+        branch.save(update_fields=['is_active', 'updated_at'])
+        action_name = 'BRANCH_ACTIVATED' if branch.is_active else 'BRANCH_DEACTIVATED'
+        record_audit(request=request, action=action_name, entity_type='Branch', entity_id=branch.id)
+        return Response({
+            'message': f"Branch '{branch.name}' is now {'Active' if branch.is_active else 'Deactivated'}.",
+            'is_active': branch.is_active
+        })
 

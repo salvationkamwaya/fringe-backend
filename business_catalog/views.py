@@ -38,13 +38,24 @@ class CategoryViewSet(viewsets.ModelViewSet):
             if not slug:
                 slug = f"cat-{Category.objects.count() + 1}"
 
-        # Prevent duplicate slug collisions in the same business unit
-        existing = Category.objects.filter(business_unit_id=unit_id, slug=slug).first()
+        # Prevent duplicate slug collisions in the same business unit & branch
+        branch_id = getattr(self.request, 'branch_id', None)
+        if not branch_id or branch_id == 'all':
+            branch_id = getattr(user, 'branch_id', None)
+        payload_branch = self.request.data.get('branch')
+        if user.role == User.ROLE_OWNER and payload_branch:
+            branch_id = payload_branch
+        if branch_id and str(branch_id).isdigit():
+            branch_id = int(branch_id)
+        else:
+            branch_id = None
+
+        existing = Category.objects.filter(business_unit_id=unit_id, branch_id=branch_id, slug=slug).first()
         if existing:
             from rest_framework.exceptions import ValidationError
-            raise ValidationError({'name': [f"A category '{existing.name}' already exists in this business unit."]})
+            raise ValidationError({'name': [f"A category '{existing.name}' already exists in this branch."]})
             
-        instance = serializer.save(business_unit_id=unit_id, slug=slug)
+        instance = serializer.save(business_unit_id=unit_id, branch_id=branch_id, slug=slug)
         record_audit(
             request=self.request,
             action='CATEGORY_CREATED',
@@ -90,9 +101,13 @@ class ProductViewSet(viewsets.ModelViewSet):
         req_unit = getattr(self.request, 'business_unit', None)
         user = self.request.user
 
-        if user.role != 'owner' and req_unit and obj.business_unit_id != req_unit:
-            # Enforce 404 on cross-unit access
-            raise Http404("Product not found.")
+        if user.role != 'owner':
+            if req_unit and obj.business_unit_id != req_unit:
+                # Enforce 404 on cross-unit access
+                raise Http404("Product not found.")
+            if user.branch_id and obj.branch_id and obj.branch_id != user.branch_id:
+                # Enforce 404 on cross-branch access
+                raise Http404("Product not found.")
         return obj
 
     def perform_create(self, serializer):
@@ -104,7 +119,18 @@ class ProductViewSet(viewsets.ModelViewSet):
         if unit_id == 'all' or not unit_id:
             unit_id = user.business_unit_id or 'bar'
 
-        instance = serializer.save(business_unit_id=unit_id)
+        branch_id = getattr(self.request, 'branch_id', None)
+        if not branch_id or branch_id == 'all':
+            branch_id = getattr(user, 'branch_id', None)
+        payload_branch = self.request.data.get('branch')
+        if user.role == User.ROLE_OWNER and payload_branch:
+            branch_id = payload_branch
+        if branch_id and str(branch_id).isdigit():
+            branch_id = int(branch_id)
+        else:
+            branch_id = None
+
+        instance = serializer.save(business_unit_id=unit_id, branch_id=branch_id)
         record_audit(
             request=self.request,
             action='PRODUCT_CREATED',

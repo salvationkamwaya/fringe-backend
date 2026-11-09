@@ -50,16 +50,20 @@ class ShiftViewSet(viewsets.ModelViewSet):
         user = request.user
         is_manager = user.role in (User.ROLE_OWNER, User.ROLE_BAR_MANAGER, User.ROLE_STATIONERY_MANAGER)
         
+        branch_id = getattr(request, 'branch_id', None)
+        if not branch_id or branch_id == 'all':
+            branch_id = getattr(user, 'branch_id', None)
+        if branch_id and str(branch_id).isdigit():
+            branch_id = int(branch_id)
+        else:
+            branch_id = None
+
         if is_manager:
-            # Managers and Owner see active cashier shift for their unit
-            shift = Shift.objects.filter(
-                business_unit_id=unit_id,
-                status=Shift.STATUS_OPEN
-            ).first()
-            active_shifts = list(Shift.objects.filter(
-                business_unit_id=unit_id,
-                status=Shift.STATUS_OPEN
-            ).values(
+            shift_filter = {'business_unit_id': unit_id, 'status': Shift.STATUS_OPEN}
+            if branch_id:
+                shift_filter['branch_id'] = branch_id
+            shift = Shift.objects.filter(**shift_filter).first()
+            active_shifts = list(Shift.objects.filter(**shift_filter).values(
                 'id', 'cashier__username', 'cashier__first_name', 'cashier__last_name',
                 'opening_float', 'total_sales_cash', 'total_sales_mobile', 'started_at'
             ))
@@ -119,8 +123,17 @@ class ShiftViewSet(viewsets.ModelViewSet):
         opening_float = Decimal(str(request.data.get('opening_float', '0.00')))
         notes = request.data.get('notes', '')
 
+        branch_id = getattr(request, 'branch_id', None)
+        if not branch_id or branch_id == 'all':
+            branch_id = getattr(user, 'branch_id', None)
+        if branch_id and str(branch_id).isdigit():
+            branch_id = int(branch_id)
+        else:
+            branch_id = None
+
         shift = Shift.objects.create(
             business_unit_id=unit_id,
+            branch_id=branch_id,
             cashier=request.user,
             opening_float=opening_float,
             expected_cash=opening_float,
@@ -213,8 +226,17 @@ class BarTabViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         user = self.request.user
+        branch_id = getattr(self.request, 'branch_id', None)
+        if not branch_id or branch_id == 'all':
+            branch_id = getattr(user, 'branch_id', None)
+        if branch_id and str(branch_id).isdigit():
+            branch_id = int(branch_id)
+        else:
+            branch_id = None
+
         tab = serializer.save(
             business_unit_id='bar',
+            branch_id=branch_id,
             opened_by=user,
             status=BarTab.STATUS_OPEN
         )
@@ -1048,12 +1070,31 @@ class OrderViewSet(viewsets.ModelViewSet):
                 business_unit_id=unit_id, cashier=user, status=Shift.STATUS_OPEN
             ).first()
 
-        # 5. CREATE ORDER (With Retail vs Wholesale identifier)
-        prefix = 'BAR' if unit_id == 'bar' else ('STN-WS' if order_type == 'WHOLESALE' else 'STN')
+        # 5. CREATE ORDER (With Retail vs Wholesale identifier and Branch code)
+        branch_id = getattr(request, 'branch_id', None)
+        if not branch_id or branch_id == 'all':
+            branch_id = getattr(user, 'branch_id', None)
+        if branch_id and str(branch_id).isdigit():
+            branch_id = int(branch_id)
+        else:
+            branch_id = None
+
+        branch_code = None
+        if branch_id:
+            from business_core.models import Branch
+            b = Branch.objects.filter(id=branch_id).first()
+            if b:
+                branch_code = b.code
+
+        if branch_code:
+            prefix = branch_code.upper()
+        else:
+            prefix = 'BAR' if unit_id == 'bar' else ('STN-WS' if order_type == 'WHOLESALE' else 'STN')
         order_number = f"{prefix}-{timezone.now().strftime('%y%m%d%H%M')}-{uuid.uuid4().hex[:4].upper()}"
 
         order = Order.objects.create(
             business_unit_id=unit_id,
+            branch_id=branch_id,
             order_number=order_number,
             shift=shift,
             tab=tab,
@@ -1321,7 +1362,18 @@ def bar_reports_view(request):
 
     start_dt, end_dt, range_label, range_type, s_str, e_str = parse_date_range(request)
 
+    branch_id = getattr(request, 'branch_id', None)
+    if not branch_id or branch_id == 'all':
+        if request.user.role != User.ROLE_OWNER:
+            branch_id = request.user.branch_id
+    if branch_id and str(branch_id).isdigit():
+        branch_id = int(branch_id)
+    else:
+        branch_id = None
+
     completed_orders = Order.objects.filter(business_unit_id='bar', status=Order.STATUS_COMPLETED)
+    if branch_id:
+        completed_orders = completed_orders.filter(branch_id=branch_id)
     if start_dt and end_dt:
         completed_orders = completed_orders.filter(created_at__range=(start_dt, end_dt))
 
@@ -1331,6 +1383,8 @@ def bar_reports_view(request):
 
     # Payments breakdown
     payments = Payment.objects.filter(order__business_unit_id='bar', order__status=Order.STATUS_COMPLETED)
+    if branch_id:
+        payments = payments.filter(order__branch_id=branch_id)
     if start_dt and end_dt:
         payments = payments.filter(order__created_at__range=(start_dt, end_dt))
 
@@ -1415,6 +1469,8 @@ def bar_reports_view(request):
 
     # Inventory Valuation
     bar_products = Product.objects.filter(business_unit_id='bar', is_active=True)
+    if branch_id:
+        bar_products = bar_products.filter(branch_id=branch_id)
     val_at_cost = Decimal('0.00')
     val_at_retail = Decimal('0.00')
     total_stock_units = Decimal('0.00')
@@ -1449,6 +1505,8 @@ def bar_reports_view(request):
 
     # Recent Shifts
     shifts_query = Shift.objects.filter(business_unit_id='bar')
+    if branch_id:
+        shifts_query = shifts_query.filter(branch_id=branch_id)
     if start_dt and end_dt:
         shifts_query = shifts_query.filter(started_at__range=(start_dt, end_dt))
     recent_shifts = []
@@ -1652,6 +1710,30 @@ def bar_reports_view(request):
         'product_sales': product_sales,
         'stock_on_hand': stock_on_hand,
         'recent_shifts': recent_shifts,
+        'branch_breakdown': [
+            {
+                'id': b.id,
+                'name': b.name,
+                'code': b.code,
+                'address': b.address,
+                'phone': b.phone,
+                'total_revenue': str(
+                    Order.objects.filter(
+                        business_unit_id='bar', branch_id=b.id, status=Order.STATUS_COMPLETED
+                    ).filter(
+                        **({'created_at__range': (start_dt, end_dt)} if start_dt and end_dt else {})
+                    ).aggregate(t=Sum('final_amount'))['t'] or Decimal('0.00')
+                ),
+                'total_orders': Order.objects.filter(
+                    business_unit_id='bar', branch_id=b.id, status=Order.STATUS_COMPLETED
+                ).filter(
+                    **({'created_at__range': (start_dt, end_dt)} if start_dt and end_dt else {})
+                ).count(),
+            }
+            for b in __import__('business_core.models', fromlist=['Branch']).Branch.objects.filter(
+                business_unit_id='bar', is_active=True
+            )
+        ] if request.user.role == User.ROLE_OWNER else [],
         'profit_snapshot': {
             'total_revenue': str(total_revenue),
             'cogs': str(cogs),

@@ -1,5 +1,5 @@
 from rest_framework import serializers
-from .models import BusinessUnit, User, AuditLog
+from .models import BusinessUnit, Branch, User, AuditLog
 
 
 class BusinessUnitSerializer(serializers.ModelSerializer):
@@ -8,17 +8,36 @@ class BusinessUnitSerializer(serializers.ModelSerializer):
         fields = ['id', 'name', 'code', 'currency', 'settings', 'is_active', 'created_at']
 
 
+class BranchSerializer(serializers.ModelSerializer):
+    manager_name = serializers.ReadOnlyField(source='manager.username')
+    staff_count = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Branch
+        fields = [
+            'id', 'business_unit', 'name', 'code', 'address', 'phone',
+            'manager', 'manager_name', 'staff_count', 'is_active', 'created_at', 'updated_at'
+        ]
+        read_only_fields = ['id', 'created_at', 'updated_at', 'staff_count']
+
+    def get_staff_count(self, obj) -> int:
+        return obj.staff_members.filter(is_active=True).count()
+
+
 class UserSerializer(serializers.ModelSerializer):
     has_pin = serializers.SerializerMethodField()
     business_unit_name = serializers.ReadOnlyField(source='business_unit.name')
+    branch_name = serializers.ReadOnlyField(source='branch.name')
+    branch_code = serializers.ReadOnlyField(source='branch.code')
     role_display = serializers.CharField(source='get_role_display', read_only=True)
 
     class Meta:
         model = User
         fields = [
             'id', 'username', 'email', 'first_name', 'last_name',
-            'role', 'role_display', 'business_unit', 'business_unit_name', 'is_active',
-            'has_pin', 'date_joined'
+            'role', 'role_display', 'business_unit', 'business_unit_name',
+            'branch', 'branch_name', 'branch_code',
+            'is_active', 'has_pin', 'date_joined'
         ]
         read_only_fields = ['id', 'has_pin', 'date_joined', 'role_display']
 
@@ -46,6 +65,8 @@ class UserManagementSerializer(serializers.ModelSerializer):
     pin = serializers.CharField(write_only=True, required=False, allow_blank=True, min_length=4, max_length=6)
     has_pin = serializers.SerializerMethodField()
     business_unit_name = serializers.ReadOnlyField(source='business_unit.name')
+    branch_name = serializers.ReadOnlyField(source='branch.name')
+    branch_code = serializers.ReadOnlyField(source='branch.code')
     role_display = serializers.CharField(source='get_role_display', read_only=True)
 
     class Meta:
@@ -53,6 +74,7 @@ class UserManagementSerializer(serializers.ModelSerializer):
         fields = [
             'id', 'username', 'email', 'first_name', 'last_name',
             'role', 'role_display', 'business_unit', 'business_unit_name',
+            'branch', 'branch_name', 'branch_code',
             'password', 'pin', 'has_pin', 'is_active', 'date_joined'
         ]
         read_only_fields = ['id', 'has_pin', 'date_joined', 'role_display']

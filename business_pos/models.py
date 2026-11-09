@@ -174,10 +174,13 @@ class Order(TenantModel):
         ordering = ['-created_at']
 
     @classmethod
-    def generate_order_number(cls, unit_id: str) -> str:
+    def generate_order_number(cls, unit_id: str, branch_code: str = None) -> str:
         timestamp = timezone.now().strftime('%y%m%d%H%M')
         rand = uuid.uuid4().hex[:4].upper()
-        prefix = 'BAR' if unit_id == 'bar' else 'STN'
+        if branch_code:
+            prefix = branch_code.upper()
+        else:
+            prefix = 'BAR' if unit_id == 'bar' else 'STN'
         return f"{prefix}-{timestamp}-{rand}"
 
     def __str__(self):

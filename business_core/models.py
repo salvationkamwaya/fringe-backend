@@ -21,6 +21,40 @@ class BusinessUnit(models.Model):
         return f"{self.name} ({self.code})"
 
 
+class Branch(models.Model):
+    """
+    Physical branch location created dynamically by the Business Owner.
+    Scoped under a BusinessUnit (e.g. multiple Bar & Lounge branches).
+    """
+    business_unit = models.ForeignKey(
+        BusinessUnit,
+        on_delete=models.CASCADE,
+        related_name='branches',
+        db_index=True
+    )
+    name = models.CharField(max_length=150, help_text="e.g., Mikocheni Lounge")
+    code = models.CharField(max_length=20, unique=True, help_text="e.g., MKC-01")
+    address = models.CharField(max_length=255, blank=True, help_text="Physical location / street address")
+    phone = models.CharField(max_length=50, blank=True)
+    manager = models.ForeignKey(
+        'User',
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='managed_branches'
+    )
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['name']
+        verbose_name_plural = 'Branches'
+
+    def __str__(self):
+        return f"{self.name} ({self.code})"
+
+
 class User(AbstractUser):
     """
     Custom user model supporting the 6 system roles, business unit context,
@@ -50,6 +84,14 @@ class User(AbstractUser):
         on_delete=models.SET_NULL,
         related_name='staff',
         help_text="Primary business unit. Null for Owner."
+    )
+    branch = models.ForeignKey(
+        Branch,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='staff_members',
+        help_text="Single assigned branch. Frontline staff can only ring up sales and view tabs at this branch."
     )
     assigned_units = models.ManyToManyField(
         BusinessUnit,
@@ -131,26 +173,47 @@ class User(AbstractUser):
 
 class TenantQuerySet(models.QuerySet):
     """
-    QuerySet that scopes rows strictly by business unit.
+    QuerySet that scopes rows strictly by business unit and branch.
     """
     def for_unit(self, unit_id: str):
         if not unit_id or unit_id == 'all':
             return self
         return self.filter(business_unit_id=unit_id)
 
-    def for_request(self, request):
-        if not hasattr(request, 'business_unit'):
-            return self.none()
-        
-        # If user is owner and active context is 'all' or None, allow cross-unit read
-        if getattr(request.user, 'role', None) == User.ROLE_OWNER and (
-            request.business_unit is None or request.business_unit == 'all'
-        ):
+    def for_branch(self, branch_id):
+        if not branch_id or branch_id == 'all':
             return self
+        return self.filter(branch_id=branch_id)
 
-        # Otherwise filter strictly by request.business_unit
-        unit_id = getattr(request.business_unit, 'id', request.business_unit)
-        return self.filter(business_unit_id=unit_id)
+    def for_request(self, request):
+        qs = self
+        user = getattr(request, 'user', None)
+        is_owner = getattr(user, 'role', None) == User.ROLE_OWNER
+
+        # 1. Filter by business unit
+        unit_id = getattr(request, 'business_unit', None)
+        if hasattr(unit_id, 'id'):
+            unit_id = unit_id.id
+        if not unit_id or unit_id == 'all':
+            if not is_owner and user and user.is_authenticated:
+                unit_id = user.business_unit_id
+
+        if not (is_owner and (unit_id is None or unit_id == 'all')):
+            if unit_id:
+                qs = qs.filter(business_unit_id=unit_id)
+
+        # 2. Filter by branch
+        if not is_owner and user and user.is_authenticated:
+            # Frontline staff and local branch managers can ONLY see their assigned branch
+            if user.branch_id:
+                qs = qs.filter(branch_id=user.branch_id)
+        else:
+            # Business Owner can filter by a specific branch if selected, or 'all'
+            req_branch = getattr(request, 'branch_id', None)
+            if req_branch and req_branch != 'all':
+                qs = qs.filter(branch_id=req_branch)
+
+        return qs
 
 
 class TenantManager(models.Manager.from_queryset(TenantQuerySet)):
@@ -163,6 +226,14 @@ class TenantModel(models.Model):
     """
     business_unit = models.ForeignKey(
         BusinessUnit,
+        on_delete=models.CASCADE,
+        related_name='%(class)s_items',
+        db_index=True
+    )
+    branch = models.ForeignKey(
+        Branch,
+        null=True,
+        blank=True,
         on_delete=models.CASCADE,
         related_name='%(class)s_items',
         db_index=True
@@ -187,6 +258,14 @@ class AuditLog(models.Model):
         blank=True,
         on_delete=models.SET_NULL,
         related_name='audit_logs',
+        db_index=True
+    )
+    branch = models.ForeignKey(
+        Branch,
+        null=True,
+        blank=True,
+        on_delete=models.SET_NULL,
+        related_name='audit_entries',
         db_index=True
     )
     user = models.ForeignKey(

@@ -17,17 +17,23 @@ class TenantMiddleware:
         self.token_auth = TokenAuthentication()
 
     def __call__(self, request):
-        # 1. Resolve user if unauthenticated in Django session but Token provided
-        if not getattr(request, 'user', None) or not request.user.is_authenticated:
-            try:
-                auth_result = self.token_auth.authenticate(request)
-                if auth_result:
-                    request.user, request.auth = auth_result
-            except Exception:
-                pass  # Invalid token will be caught by DRF permission classes
+        # 1. Resolve user if unauthenticated in Django session but Token or forced user provided
+        user = getattr(request, 'user', None)
+        if not user or not user.is_authenticated:
+            forced_user = getattr(request, '_force_auth_user', None)
+            if forced_user and forced_user.is_authenticated:
+                request.user = forced_user
+            else:
+                try:
+                    auth_result = self.token_auth.authenticate(request)
+                    if auth_result:
+                        request.user, request.auth = auth_result
+                except Exception:
+                    pass  # Invalid token will be caught by DRF permission classes
 
         # 2. Extract requested business context from headers or user
         unit_header = request.headers.get('X-Business-Unit') or request.META.get('HTTP_X_BUSINESS_UNIT')
+        branch_header = request.headers.get('X-Branch-Id') or request.META.get('HTTP_X_BRANCH_ID')
         user = getattr(request, 'user', None)
 
         if user and user.is_authenticated:
@@ -37,6 +43,12 @@ class TenantMiddleware:
                     request.business_unit = unit_header
                 else:
                     request.business_unit = 'all'
+
+                # Owner can dynamically view any branch or 'all'
+                if branch_header and branch_header != 'all':
+                    request.branch_id = branch_header
+                else:
+                    request.branch_id = 'all'
                 
                 # Check for explicit business switcher event
                 session_last_unit = request.session.get('owner_last_business_unit')
@@ -57,14 +69,22 @@ class TenantMiddleware:
                     request.business_unit = unit_header
                 else:
                     request.business_unit = user.business_unit_id
+                request.branch_id = user.branch_id
             else:
                 # All other roles are strictly locked to user.business_unit_id
                 if unit_header and unit_header != user.business_unit_id:
                     # Non-owner attempting to access outside their unit returns 404
                     raise Http404("Resource not found")
+                
+                # Non-owner staff are permanently locked to their assigned branch
+                if branch_header and user.branch_id and str(branch_header) != str(user.branch_id):
+                    raise Http404("Resource not found")
+
                 request.business_unit = user.business_unit_id
+                request.branch_id = user.branch_id
         else:
             # Anonymous / pre-auth requests
             request.business_unit = unit_header if unit_header in ('bar', 'stationery') else None
+            request.branch_id = branch_header if branch_header else None
 
         return self.get_response(request)

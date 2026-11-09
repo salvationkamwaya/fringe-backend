@@ -13,7 +13,7 @@ class Category(TenantModel):
 
     class Meta:
         ordering = ['display_order', 'name']
-        unique_together = ('business_unit', 'slug')
+        unique_together = ('business_unit', 'branch', 'slug')
 
     def __str__(self):
         return f"[{self.business_unit_id}] {self.name}"

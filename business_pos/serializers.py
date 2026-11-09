@@ -63,6 +63,8 @@ class OrderSerializer(serializers.ModelSerializer):
     cashier_name = serializers.ReadOnlyField(source='cashier.username')
     cashier_full_name = serializers.SerializerMethodField()
     cashier_role = serializers.ReadOnlyField(source='cashier.role')
+    branch_name = serializers.ReadOnlyField(source='branch.name')
+    branch_code = serializers.ReadOnlyField(source='branch.code')
     shift_id = serializers.ReadOnlyField(source='shift.id')
     tab_name = serializers.ReadOnlyField(source='tab.tab_name')
     customer_name = serializers.ReadOnlyField(source='customer.name')
@@ -73,7 +75,8 @@ class OrderSerializer(serializers.ModelSerializer):
     class Meta:
         model = Order
         fields = [
-            'id', 'business_unit', 'order_number', 'shift', 'shift_id', 'tab',
+            'id', 'business_unit', 'branch', 'branch_name', 'branch_code',
+            'order_number', 'shift', 'shift_id', 'tab',
             'tab_name', 'customer', 'customer_name', 'cashier', 'cashier_name',
             'cashier_full_name', 'cashier_role',
             'subtotal', 'discount_amount', 'discount_reason', 'discount_approved_by',
@@ -110,6 +113,7 @@ class OrderSerializer(serializers.ModelSerializer):
 
 class BarTabSerializer(serializers.ModelSerializer):
     opened_by_name = serializers.ReadOnlyField(source='opened_by.username')
+    branch_name = serializers.ReadOnlyField(source='branch.name')
     orders = OrderSerializer(many=True, read_only=True)
     total_amount = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
     total_paid = serializers.DecimalField(max_digits=12, decimal_places=2, read_only=True)
@@ -119,7 +123,7 @@ class BarTabSerializer(serializers.ModelSerializer):
     class Meta:
         model = BarTab
         fields = [
-            'id', 'business_unit', 'tab_name', 'customer_name',
+            'id', 'business_unit', 'branch', 'branch_name', 'tab_name', 'customer_name',
             'status', 'opened_by', 'opened_by_name', 'closed_by',
             'opened_at', 'closed_at', 'notes', 'total_amount',
             'total_paid', 'balance_due', 'items_count', 'orders'
@@ -129,11 +133,12 @@ class BarTabSerializer(serializers.ModelSerializer):
 
 class ShiftSerializer(serializers.ModelSerializer):
     cashier_name = serializers.ReadOnlyField(source='cashier.username')
+    branch_name = serializers.ReadOnlyField(source='branch.name')
 
     class Meta:
         model = Shift
         fields = [
-            'id', 'business_unit', 'cashier', 'cashier_name',
+            'id', 'business_unit', 'branch', 'branch_name', 'cashier', 'cashier_name',
             'started_at', 'ended_at', 'opening_float',
             'expected_cash', 'counted_cash', 'variance', 'variance_reason',
             'total_sales_cash', 'total_sales_mobile', 'total_sales_credit',

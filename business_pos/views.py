@@ -41,6 +41,24 @@ class ShiftViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         return Shift.objects.for_request(self.request)
 
+    def destroy(self, request, *args, **kwargs):
+        return Response({
+            'error': 'Cash register shifts cannot be deleted for audit and financial integrity.',
+            'code': 'SHIFT_DELETE_FORBIDDEN'
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def update(self, request, *args, **kwargs):
+        return Response({
+            'error': 'Shifts cannot be directly updated. Use close_shift to complete drawer reconciliation.',
+            'code': 'SHIFT_UPDATE_FORBIDDEN'
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def partial_update(self, request, *args, **kwargs):
+        return Response({
+            'error': 'Shifts cannot be directly updated. Use close_shift to complete drawer reconciliation.',
+            'code': 'SHIFT_UPDATE_FORBIDDEN'
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
     @action(detail=False, methods=['get'])
     def current(self, request):
         unit_id = getattr(request, 'business_unit', request.user.business_unit_id)
@@ -224,8 +242,17 @@ class BarTabViewSet(viewsets.ModelViewSet):
     def get_queryset(self):
         return BarTab.objects.for_request(self.request).filter(business_unit_id='bar')
 
+    def destroy(self, request, *args, **kwargs):
+        return Response({
+            'error': 'Bar tabs cannot be hard deleted. Settle or close the tab, or void the attached orders with manager approval.',
+            'code': 'TAB_DELETE_FORBIDDEN'
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
     def perform_create(self, serializer):
         user = self.request.user
+        if not (user.is_owner or user.role in (User.ROLE_BAR_MANAGER, User.ROLE_BARTENDER)):
+            self.permission_denied(self.request, message="Only Bar & Grocery staff or Owner can open tabs.")
+
         branch_id = getattr(self.request, 'branch_id', None)
         if not branch_id or branch_id == 'all':
             branch_id = getattr(user, 'branch_id', None)
@@ -413,6 +440,9 @@ class CustomerViewSet(viewsets.ModelViewSet):
 
     def perform_create(self, serializer):
         user = self.request.user
+        if not (user.is_owner or user.role in (User.ROLE_STATIONERY_MANAGER, User.ROLE_STATIONERY_CASHIER)):
+            self.permission_denied(self.request, message="Permission Denied: Only Stationery staff or Business Owner can register customers.")
+
         customer = serializer.save(business_unit_id='stationery')
         record_audit(
             request=self.request,
@@ -422,6 +452,46 @@ class CustomerViewSet(viewsets.ModelViewSet):
             after_value={'name': customer.name, 'credit_limit': str(customer.credit_limit)}
         )
 
+    def perform_update(self, serializer):
+        user = self.request.user
+        if not (user.is_owner or user.role in (User.ROLE_STATIONERY_MANAGER, User.ROLE_STATIONERY_CASHIER)):
+            self.permission_denied(self.request, message="Permission Denied: Only Stationery staff or Business Owner can update customer records.")
+
+        old_instance = self.get_object()
+        new_limit = serializer.validated_data.get('credit_limit')
+        if new_limit is not None and Decimal(str(new_limit)) != old_instance.credit_limit:
+            if not user.is_stationery_manager_or_owner:
+                self.permission_denied(self.request, message="Permission Denied: Modifying customer credit limits is strictly restricted to Stationery Managers and Business Owners.")
+
+        customer = serializer.save()
+        record_audit(
+            request=self.request,
+            action='CUSTOMER_UPDATED',
+            entity_type='Customer',
+            entity_id=customer.id,
+            after_value={'name': customer.name, 'credit_limit': str(customer.credit_limit)}
+        )
+
+    def perform_destroy(self, instance):
+        user = self.request.user
+        if not user.is_stationery_manager_or_owner:
+            self.permission_denied(self.request, message="Permission Denied: Only Stationery Managers and Business Owners can delete customer accounts.")
+
+        if instance.current_balance > Decimal('0.00'):
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({'error': f"Cannot delete customer '{instance.name}' because they have an active outstanding debt of TSH {instance.current_balance}."})
+
+        cust_id = instance.id
+        cust_name = instance.name
+        instance.delete()
+        record_audit(
+            request=self.request,
+            action='CUSTOMER_DELETED',
+            entity_type='Customer',
+            entity_id=cust_id,
+            metadata={'name': cust_name, 'deleted_by': user.username}
+        )
+
     @action(detail=True, methods=['post'])
     @transaction.atomic
     def record_payment(self, request, pk=None):
@@ -429,6 +499,9 @@ class CustomerViewSet(viewsets.ModelViewSet):
         Record a customer debt repayment (Cash, Mobile Money, Bank Transfer).
         Decrements customer.current_balance and updates active shift drawer if cash.
         """
+        user = request.user
+        if not (user.is_owner or user.role in (User.ROLE_STATIONERY_MANAGER, User.ROLE_STATIONERY_CASHIER)):
+            return Response({'error': 'Permission Denied: Only Stationery Cashier, Manager, or Owner can record customer repayments.'}, status=status.HTTP_403_FORBIDDEN)
         customer = self.get_object()
         amount = Decimal(str(request.data.get('amount', '0.00')))
         payment_method = request.data.get('payment_method', 'CASH').upper()
@@ -589,7 +662,11 @@ class SupplierViewSet(viewsets.ModelViewSet):
         return Supplier.objects.for_request(self.request)
 
     def perform_create(self, serializer):
-        unit_id = getattr(self.request, 'business_unit', self.request.user.business_unit_id) or 'stationery'
+        user = self.request.user
+        if user.role not in (User.ROLE_OWNER, User.ROLE_BAR_MANAGER, User.ROLE_STATIONERY_MANAGER, User.ROLE_STOCK_CLERK):
+            self.permission_denied(self.request, message="Permission Denied: Only Managers, Stock Clerks, or Business Owner can register suppliers.")
+
+        unit_id = getattr(self.request, 'business_unit', user.business_unit_id) or 'bar'
         instance = serializer.save(business_unit_id=unit_id)
         record_audit(
             request=self.request,
@@ -597,6 +674,42 @@ class SupplierViewSet(viewsets.ModelViewSet):
             entity_type='Supplier',
             entity_id=instance.id,
             after_value={'name': instance.name}
+        )
+
+    def perform_update(self, serializer):
+        user = self.request.user
+        if user.role not in (User.ROLE_OWNER, User.ROLE_BAR_MANAGER, User.ROLE_STATIONERY_MANAGER, User.ROLE_STOCK_CLERK):
+            self.permission_denied(self.request, message="Permission Denied: Only Managers, Stock Clerks, or Business Owner can update supplier details.")
+
+        old_name = self.get_object().name
+        instance = serializer.save()
+        record_audit(
+            request=self.request,
+            action='SUPPLIER_UPDATED',
+            entity_type='Supplier',
+            entity_id=instance.id,
+            before_value={'name': old_name},
+            after_value={'name': instance.name}
+        )
+
+    def perform_destroy(self, instance):
+        user = self.request.user
+        if not user.is_manager_or_owner:
+            self.permission_denied(self.request, message="Permission Denied: Only Managers or Business Owner can delete suppliers.")
+
+        if instance.balance_payable > Decimal('0.00'):
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({'error': f"Cannot delete supplier '{instance.name}' because there is an outstanding payable of TSH {instance.balance_payable}."})
+
+        sup_id = instance.id
+        sup_name = instance.name
+        instance.delete()
+        record_audit(
+            request=self.request,
+            action='SUPPLIER_DELETED',
+            entity_type='Supplier',
+            entity_id=sup_id,
+            metadata={'name': sup_name, 'deleted_by': user.username}
         )
 
 
@@ -613,7 +726,10 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
     @transaction.atomic
     def perform_create(self, serializer):
         user = self.request.user
-        unit_id = getattr(self.request, 'business_unit', user.business_unit_id) or 'stationery'
+        if user.role not in (User.ROLE_OWNER, User.ROLE_BAR_MANAGER, User.ROLE_STATIONERY_MANAGER, User.ROLE_STOCK_CLERK):
+            self.permission_denied(self.request, message="Permission Denied: Only Managers, Stock Clerks, or Business Owner can create purchase orders.")
+
+        unit_id = getattr(self.request, 'business_unit', user.business_unit_id) or 'bar'
         order_number = f"PO-{timezone.now().strftime('%y%m%d%H%M')}-{uuid.uuid4().hex[:4].upper()}"
 
         po = serializer.save(
@@ -636,10 +752,48 @@ class PurchaseOrderViewSet(viewsets.ModelViewSet):
             after_value={'total_cost': str(po.total_cost), 'supplier': supplier.name}
         )
 
+    def perform_update(self, serializer):
+        user = self.request.user
+        if user.role not in (User.ROLE_OWNER, User.ROLE_BAR_MANAGER, User.ROLE_STATIONERY_MANAGER, User.ROLE_STOCK_CLERK):
+            self.permission_denied(self.request, message="Permission Denied: Only Managers, Stock Clerks, or Business Owner can update purchase orders.")
+
+        instance = serializer.save()
+        record_audit(
+            request=self.request,
+            action='PURCHASE_ORDER_UPDATED',
+            entity_type='PurchaseOrder',
+            entity_id=instance.id,
+            after_value={'status': instance.status}
+        )
+
+    def perform_destroy(self, instance):
+        user = self.request.user
+        if user.role != User.ROLE_OWNER:
+            self.permission_denied(self.request, message="Permission Denied: Only the Business Owner can delete purchase orders.")
+
+        if instance.amount_paid > Decimal('0.00'):
+            from rest_framework.exceptions import ValidationError
+            raise ValidationError({'error': 'Cannot delete a purchase order that has registered payments.'})
+
+        po_id = instance.id
+        po_num = instance.order_number
+        instance.delete()
+        record_audit(
+            request=self.request,
+            action='PURCHASE_ORDER_DELETED',
+            entity_type='PurchaseOrder',
+            entity_id=po_id,
+            metadata={'order_number': po_num, 'deleted_by': user.username}
+        )
+
     @action(detail=True, methods=['post'])
     @transaction.atomic
     def record_payment(self, request, pk=None):
         """Pay supplier against a purchase order."""
+        user = request.user
+        if user.role not in (User.ROLE_OWNER, User.ROLE_BAR_MANAGER, User.ROLE_STATIONERY_MANAGER, User.ROLE_STOCK_CLERK):
+            return Response({'error': 'Permission Denied: Only Managers, Stock Clerks, or Owner can record supplier payments.'}, status=status.HTTP_403_FORBIDDEN)
+
         po = self.get_object()
         amount = Decimal(str(request.data.get('amount', '0.00')))
         payment_method = request.data.get('payment_method', 'BANK_TRANSFER')
@@ -723,6 +877,24 @@ class OrderViewSet(viewsets.ModelViewSet):
         qs = Order.objects.for_request(self.request).select_related(
             'cashier', 'shift', 'tab', 'customer'
         ).prefetch_related('items__product', 'payments').order_by('-created_at')
+
+    def destroy(self, request, *args, **kwargs):
+        return Response({
+            'error': 'Completed sales and orders are immutable legal records and cannot be deleted. If an order needs cancellation, use manager void authorization.',
+            'code': 'ORDER_DELETE_FORBIDDEN'
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def update(self, request, *args, **kwargs):
+        return Response({
+            'error': 'Orders are immutable records and cannot be modified after transaction completion.',
+            'code': 'ORDER_UPDATE_FORBIDDEN'
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def partial_update(self, request, *args, **kwargs):
+        return Response({
+            'error': 'Orders are immutable records and cannot be modified after transaction completion.',
+            'code': 'ORDER_UPDATE_FORBIDDEN'
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
         user = self.request.user
         params = self.request.query_params
@@ -2472,7 +2644,7 @@ def expenses_view(request):
         })
 
     # POST: Record expense
-    if not request.user.is_stationery_manager_or_owner and request.user.role != User.ROLE_STOCK_CLERK:
+    if not (request.user.is_manager_or_owner or request.user.role == User.ROLE_STOCK_CLERK):
         return Response({
             'error': 'Manager, Owner, or Stock Clerk privileges required to record expenses.'
         }, status=status.HTTP_403_FORBIDDEN)
@@ -2495,7 +2667,8 @@ def expenses_view(request):
 @permission_classes([permissions.IsAuthenticated])
 def expense_detail_view(request, expense_id):
     """Delete an expense (Manager/Owner only)"""
-    if not request.user.is_stationery_manager_or_owner:
+    if not request.user.is_manager_or_owner:
+        return Response({'error': 'Only Managers and Business Owners can delete expenses.'}, status=status.HTTP_403_FORBIDDEN)
         return Response({'error': 'Only Managers and Business Owners can delete expenses.'}, status=status.HTTP_403_FORBIDDEN)
     
     unit_id = getattr(request, 'business_unit', request.user.business_unit_id) or 'stationery'
@@ -2674,12 +2847,16 @@ def returns_view(request):
 @permission_classes([permissions.IsAuthenticated])
 def product_bulk_import_view(request):
     """
-    Import stationery products in bulk from CSV/Excel data.
+    Import catalog products/drinks in bulk from CSV/Excel data.
     """
-    if not request.user.is_stationery_manager_or_owner and request.user.role != User.ROLE_STOCK_CLERK:
+    if not (request.user.is_manager_or_owner or request.user.role == User.ROLE_STOCK_CLERK):
         return Response({
             'error': 'Manager, Owner, or Stock Clerk privileges required to import catalog items.'
         }, status=status.HTTP_403_FORBIDDEN)
+
+    unit_id = getattr(request, 'business_unit', request.user.business_unit_id) or 'bar'
+    if unit_id == 'all':
+        unit_id = request.user.business_unit_id or 'bar'
 
     products_data = request.data.get('products', [])
     if not products_data:
@@ -2699,7 +2876,7 @@ def product_bulk_import_view(request):
         cat = None
         if cat_name:
             cat, _ = Category.objects.get_or_create(
-                business_unit_id='stationery',
+                business_unit_id=unit_id,
                 name=cat_name,
                 defaults={'slug': cat_name.lower().replace(' ', '-')}
             )
@@ -2714,13 +2891,13 @@ def product_bulk_import_view(request):
 
         is_pack = bool(row.get('is_pack', False))
         ratio = int(row.get('pack_unit_ratio', 1) or 1)
-        pack_name = row.get('pack_name', 'Pack') or 'Pack'
-        unit_name = row.get('unit_name', 'Piece') or 'Piece'
+        pack_name = row.get('pack_name', 'Crate' if unit_id == 'bar' else 'Pack') or ('Crate' if unit_id == 'bar' else 'Pack')
+        unit_name = row.get('unit_name', 'Bottle' if unit_id == 'bar' else 'Piece') or ('Bottle' if unit_id == 'bar' else 'Piece')
         allow_split = bool(row.get('allow_split_sale', False))
         split_price = Decimal(str(row.get('split_unit_price', '0.00'))) if (allow_split and row.get('split_unit_price')) else None
 
         prod, created = Product.objects.update_or_create(
-            business_unit_id='stationery',
+            business_unit_id=unit_id,
             name=name,
             defaults={
                 'category': cat,

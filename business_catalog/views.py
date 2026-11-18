@@ -17,6 +17,12 @@ class CategoryViewSet(viewsets.ModelViewSet):
     serializer_class = CategorySerializer
     permission_classes = [permissions.IsAuthenticated]
 
+    def get_permissions(self):
+        if self.action in ['create', 'update', 'partial_update', 'destroy']:
+            from business_core.permissions import IsManagerOrOwner
+            return [permissions.IsAuthenticated(), IsManagerOrOwner()]
+        return [permissions.IsAuthenticated()]
+
     def get_queryset(self):
         return Category.objects.for_request(self.request)
 
@@ -29,6 +35,10 @@ class CategoryViewSet(viewsets.ModelViewSet):
         unit_id = getattr(self.request, 'business_unit', user.business_unit_id)
         if unit_id == 'all' or not unit_id:
             unit_id = user.business_unit_id or 'bar'
+
+        # Enforce business unit boundary: only Owner can manage categories across units
+        if user.role != User.ROLE_OWNER and unit_id != user.business_unit_id:
+            self.permission_denied(self.request, message=f"You do not have management permissions for business unit '{unit_id}'.")
 
         name = serializer.validated_data.get('name', '').strip()
         slug = serializer.validated_data.get('slug')
@@ -64,6 +74,45 @@ class CategoryViewSet(viewsets.ModelViewSet):
             after_value={'name': instance.name, 'slug': instance.slug}
         )
 
+    def perform_update(self, serializer):
+        user = self.request.user
+        if not user.is_manager_or_owner:
+            self.permission_denied(self.request, message="Only managers or owner can update categories.")
+
+        old_instance = self.get_object()
+        if user.role != User.ROLE_OWNER and old_instance.business_unit_id != user.business_unit_id:
+            self.permission_denied(self.request, message=f"You do not have management permissions for business unit '{old_instance.business_unit_id}'.")
+
+        old_name = old_instance.name
+        instance = serializer.save()
+        record_audit(
+            request=self.request,
+            action='CATEGORY_UPDATED',
+            entity_type='Category',
+            entity_id=instance.id,
+            before_value={'name': old_name},
+            after_value={'name': instance.name, 'slug': instance.slug}
+        )
+
+    def perform_destroy(self, instance):
+        user = self.request.user
+        if not user.is_manager_or_owner:
+            self.permission_denied(self.request, message="Only managers or owner can delete categories.")
+
+        if user.role != User.ROLE_OWNER and instance.business_unit_id != user.business_unit_id:
+            self.permission_denied(self.request, message=f"You do not have management permissions for business unit '{instance.business_unit_id}'.")
+
+        cat_id = instance.id
+        cat_name = instance.name
+        instance.delete()
+        record_audit(
+            request=self.request,
+            action='CATEGORY_DELETED',
+            entity_type='Category',
+            entity_id=cat_id,
+            metadata={'name': cat_name, 'deleted_by': user.username}
+        )
+
 
 class ProductViewSet(viewsets.ModelViewSet):
     """
@@ -74,6 +123,12 @@ class ProductViewSet(viewsets.ModelViewSet):
     """
     serializer_class = ProductSerializer
     permission_classes = [permissions.IsAuthenticated]
+
+    def get_permissions(self):
+        if self.action in ['create', 'update', 'partial_update', 'destroy']:
+            from business_core.permissions import IsManagerOrOwner
+            return [permissions.IsAuthenticated(), IsManagerOrOwner()]
+        return [permissions.IsAuthenticated()]
 
     def get_queryset(self):
         qs = Product.objects.for_request(self.request).filter(is_active=True)
@@ -119,6 +174,9 @@ class ProductViewSet(viewsets.ModelViewSet):
         if unit_id == 'all' or not unit_id:
             unit_id = user.business_unit_id or 'bar'
 
+        if user.role != User.ROLE_OWNER and unit_id != user.business_unit_id:
+            self.permission_denied(self.request, message=f"You do not have management permissions for business unit '{unit_id}'.")
+
         branch_id = getattr(self.request, 'branch_id', None)
         if not branch_id or branch_id == 'all':
             branch_id = getattr(user, 'branch_id', None)
@@ -136,7 +194,7 @@ class ProductViewSet(viewsets.ModelViewSet):
             action='PRODUCT_CREATED',
             entity_type='Product',
             entity_id=instance.id,
-            after_value={'name': instance.name, 'selling_price': str(instance.selling_price)}
+            after_value={'name': instance.name, 'selling_price': str(instance.selling_price), 'business_unit': unit_id}
         )
 
     def perform_update(self, serializer):
@@ -145,6 +203,9 @@ class ProductViewSet(viewsets.ModelViewSet):
             self.permission_denied(self.request, message="Only managers or owner can update products or change prices.")
 
         old_instance = self.get_object()
+        if user.role != User.ROLE_OWNER and old_instance.business_unit_id != user.business_unit_id:
+            self.permission_denied(self.request, message=f"You do not have management permissions for business unit '{old_instance.business_unit_id}'.")
+
         old_price = str(old_instance.selling_price)
         old_stock = str(old_instance.stock_quantity)
 
@@ -178,6 +239,10 @@ class ProductViewSet(viewsets.ModelViewSet):
         user = self.request.user
         if not user.is_manager_or_owner:
             self.permission_denied(self.request, message="Only managers or owner can deactivate products.")
+
+        if user.role != User.ROLE_OWNER and instance.business_unit_id != user.business_unit_id:
+            self.permission_denied(self.request, message=f"You do not have management permissions for business unit '{instance.business_unit_id}'.")
+
         instance.is_active = False
         instance.save(update_fields=['is_active'])
         record_audit(
@@ -205,6 +270,12 @@ class ProductViewSet(viewsets.ModelViewSet):
             }, status=status.HTTP_403_FORBIDDEN)
 
         product = self.get_object()
+        if not user.can_access_unit(product.business_unit_id):
+            return Response({
+                'error': f"Permission Denied: You do not have stock adjustment access for business unit '{product.business_unit_id}'.",
+                'code': 'UNIT_ACCESS_DENIED'
+            }, status=status.HTTP_403_FORBIDDEN)
+
         adjustment_type = request.data.get('adjustment_type', 'ADD')  # 'ADD', 'SET', 'SUBTRACT'
         try:
             qty = Decimal(str(request.data.get('quantity', '0.00')))
@@ -268,6 +339,11 @@ class ProductViewSet(viewsets.ModelViewSet):
             }, status=status.HTTP_403_FORBIDDEN)
 
         product = self.get_object()
+        if not user.can_access_unit(product.business_unit_id):
+            return Response({
+                'error': f"Permission Denied: You do not have threshold management access for business unit '{product.business_unit_id}'.",
+                'code': 'UNIT_ACCESS_DENIED'
+            }, status=status.HTTP_403_FORBIDDEN)
         try:
             threshold = Decimal(str(request.data.get('reorder_threshold', '5.00')))
             if threshold < 0:

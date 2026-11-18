@@ -137,7 +137,7 @@ def run_tests():
         'contact_person': 'Principal Banda',
         'phone': '0977889900',
         'email': 'principal@apex.edu.zm',
-        'credit_limit': '1000.00',
+        'credit_limit': str(pack_price * 5),
         'notes': 'School account - 30 days credit'
     }, format='json')
     assert res_cust.status_code == 201, f"Customer registration failed: {res_cust.data}"
@@ -162,7 +162,7 @@ def run_tests():
     print(f" [OK] Credit sale within limit: TSH {expected_debt_1} charged. Customer balance: TSH {cust.current_balance}, Available: TSH {cust.available_credit}")
 
     # 4b. Credit sale exceeding credit limit WITHOUT manager PIN -> MUST BE BLOCKED
-    excess_qty = 20 # 20 * pack_price will far exceed remaining credit
+    excess_qty = 5 # 5 * pack_price (750,000) exceeds available credit (450,000) within stock (18+)
     res_credit_blocked = client.post('/api/pos/orders/', {
         'customer_id': customer_id,
         'order_type': 'DIRECT',

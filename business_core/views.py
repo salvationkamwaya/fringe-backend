@@ -1,8 +1,10 @@
 from rest_framework import status, viewsets, permissions
 from rest_framework.decorators import api_view, permission_classes, authentication_classes, action
+from rest_framework.exceptions import ValidationError
 from rest_framework.response import Response
 from rest_framework.authtoken.models import Token
 from django.contrib.auth import authenticate
+from django.db import transaction
 from django.utils import timezone
 from django.db.models import Q
 from .models import BusinessUnit, Branch, User, AuditLog
@@ -18,6 +20,39 @@ from .tokens import (
     verify_and_consume_token,
     validate_password_strength
 )
+
+REQUIRED_UNIT_IDS = ('bar', 'stationery')
+
+
+def _get_owner_setup_status(user):
+    """
+    Returns (requires_business_setup, requires_branch_setup, active_units_list) for the given user.
+    Owners must have both 'bar' and 'stationery' active BusinessUnits initialized,
+    and at least one active Branch under each of those two BusinessUnits.
+    """
+    if user.role == User.ROLE_OWNER:
+        units = list(
+            BusinessUnit.objects.filter(is_active=True).values(
+                'id', 'name', 'code', 'currency', 'settings'
+            )
+        )
+        existing_ids = {u['id'] for u in units}
+        requires_business_setup = not all(uid in existing_ids for uid in REQUIRED_UNIT_IDS)
+
+        branch_unit_ids = set(
+            Branch.objects.filter(is_active=True, business_unit_id__in=REQUIRED_UNIT_IDS)
+            .values_list('business_unit_id', flat=True)
+            .distinct()
+        )
+        requires_branch_setup = not all(uid in branch_unit_ids for uid in REQUIRED_UNIT_IDS)
+        return requires_business_setup, requires_branch_setup, units
+
+    units = list(
+        BusinessUnit.objects.filter(id=user.business_unit_id, is_active=True).values(
+            'id', 'name', 'code', 'currency', 'settings'
+        )
+    )
+    return False, False, units
 
 
 @api_view(['POST'])
@@ -73,11 +108,10 @@ def login_view(request):
     )
 
     # Available business units and branches
+    requires_business_setup, requires_branch_setup, units = _get_owner_setup_status(user)
     if user.role == User.ROLE_OWNER:
-        units = list(BusinessUnit.objects.filter(is_active=True).values('id', 'name', 'code'))
         branches = list(Branch.objects.filter(is_active=True).values('id', 'business_unit_id', 'name', 'code', 'address', 'phone'))
     else:
-        units = list(BusinessUnit.objects.filter(id=user.business_unit_id).values('id', 'name', 'code'))
         if user.branch_id:
             branches = list(Branch.objects.filter(id=user.branch_id, is_active=True).values('id', 'business_unit_id', 'name', 'code', 'address', 'phone'))
         else:
@@ -91,6 +125,8 @@ def login_view(request):
         'user': UserSerializer(user).data,
         'active_unit': active_unit,
         'available_units': units,
+        'requires_business_setup': requires_business_setup,
+        'requires_branch_setup': requires_branch_setup,
         'active_branch': active_branch,
         'branches': branches,
     })
@@ -102,10 +138,14 @@ def me_view(request):
     """
     Get current user profile and session unit context.
     """
+    requires_business_setup, requires_branch_setup, units = _get_owner_setup_status(request.user)
     branches = list(Branch.objects.filter(is_active=True).values('id', 'business_unit_id', 'name', 'code', 'address', 'phone'))
     return Response({
         'user': UserSerializer(request.user).data,
         'active_unit': getattr(request, 'business_unit', request.user.business_unit_id or 'all'),
+        'available_units': units,
+        'requires_business_setup': requires_business_setup,
+        'requires_branch_setup': requires_branch_setup,
         'active_branch': getattr(request, 'branch_id', getattr(request.user, 'branch_id', None)),
         'branches': branches,
         'is_owner': request.user.is_owner,
@@ -211,9 +251,10 @@ def verify_manager_pin_view(request):
     })
 
 
-class BusinessUnitViewSet(viewsets.ReadOnlyModelViewSet):
+class BusinessUnitViewSet(viewsets.ModelViewSet):
     """
-    List active business units.
+    List, create, or initialize active business units ('bar' and 'stationery').
+    Only the Business Owner may create, update, or initialize business units.
     """
     queryset = BusinessUnit.objects.filter(is_active=True)
     serializer_class = BusinessUnitSerializer
@@ -224,6 +265,121 @@ class BusinessUnitViewSet(viewsets.ReadOnlyModelViewSet):
         if user.role == User.ROLE_OWNER:
             return BusinessUnit.objects.filter(is_active=True)
         return BusinessUnit.objects.filter(id=user.business_unit_id, is_active=True)
+
+    def perform_create(self, serializer):
+        if self.request.user.role != User.ROLE_OWNER:
+            self.permission_denied(self.request, message="Only the Business Owner can create business units.")
+        unit = serializer.save()
+        record_audit(
+            request=self.request,
+            action='BUSINESS_UNIT_CREATED',
+            entity_type='BusinessUnit',
+            entity_id=unit.id,
+            after_value={'id': unit.id, 'name': unit.name, 'code': unit.code, 'currency': unit.currency},
+        )
+
+    def perform_update(self, serializer):
+        if self.request.user.role != User.ROLE_OWNER:
+            self.permission_denied(self.request, message="Only the Business Owner can update business units.")
+        unit = serializer.save()
+        record_audit(
+            request=self.request,
+            action='BUSINESS_UNIT_UPDATED',
+            entity_type='BusinessUnit',
+            entity_id=unit.id,
+            after_value={'id': unit.id, 'name': unit.name, 'code': unit.code, 'currency': unit.currency},
+        )
+
+    def perform_destroy(self, instance):
+        self.permission_denied(self.request, message="Core business units cannot be deleted.")
+
+    @action(detail=False, methods=['post'], url_path='setup-initial')
+    def setup_initial(self, request):
+        """
+        Atomically initialize both required BusinessUnits ('bar' and 'stationery')
+        for the Business Owner on first login.
+        """
+        if request.user.role != User.ROLE_OWNER:
+            return Response(
+                {'error': 'Only the Business Owner can initialize business units.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        payload = {}
+        for unit_id in REQUIRED_UNIT_IDS:
+            raw = request.data.get(unit_id)
+            if not isinstance(raw, dict):
+                return Response(
+                    {'error': f"Configuration for '{unit_id}' business unit is required."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            name = (raw.get('name') or '').strip()
+            code = (raw.get('code') or '').strip().upper()
+            currency = (raw.get('currency') or 'TSH').strip().upper()[:10] or 'TSH'
+            settings_data = raw.get('settings') if isinstance(raw.get('settings'), dict) else {}
+
+            if not name:
+                return Response(
+                    {'error': f"Business name for '{unit_id}' is required."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if not code or len(code) > 10:
+                return Response(
+                    {'error': f"Business code for '{unit_id}' must be 1 to 10 characters."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            payload[unit_id] = {
+                'name': name[:100],
+                'code': code,
+                'currency': currency,
+                'settings': settings_data,
+            }
+
+        if payload['bar']['code'] == payload['stationery']['code']:
+            return Response(
+                {'error': 'Bar and Stationery business codes must be unique.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        with transaction.atomic():
+            created_or_updated = []
+            for unit_id in REQUIRED_UNIT_IDS:
+                data = payload[unit_id]
+                unit, _ = BusinessUnit.objects.update_or_create(
+                    id=unit_id,
+                    defaults={
+                        'name': data['name'],
+                        'code': data['code'],
+                        'currency': data['currency'],
+                        'settings': data['settings'],
+                        'is_active': True,
+                    },
+                )
+                created_or_updated.append(unit)
+
+            record_audit(
+                request=request,
+                action='BUSINESS_UNITS_INITIALIZED',
+                entity_type='BusinessUnit',
+                entity_id='bar,stationery',
+                after_value={
+                    uid: {
+                        'name': payload[uid]['name'],
+                        'code': payload[uid]['code'],
+                        'currency': payload[uid]['currency'],
+                    }
+                    for uid in REQUIRED_UNIT_IDS
+                },
+            )
+
+        return Response(
+            {
+                'business_units': BusinessUnitSerializer(created_or_updated, many=True).data,
+                'requires_business_setup': False,
+            },
+            status=status.HTTP_200_OK,
+        )
 
 
 class AuditLogViewSet(viewsets.ReadOnlyModelViewSet):
@@ -649,6 +805,11 @@ class BranchViewSet(viewsets.ModelViewSet):
         if unit_id == 'all' or not unit_id:
             unit_id = 'bar'
 
+        if not BusinessUnit.objects.filter(id=unit_id, is_active=True).exists():
+            raise ValidationError({
+                'business_unit': f"Business unit '{unit_id}' has not been initialized yet. Please complete business setup first."
+            })
+
         branch = serializer.save(business_unit_id=unit_id)
         record_audit(
             request=self.request,
@@ -689,4 +850,113 @@ class BranchViewSet(viewsets.ModelViewSet):
             'message': f"Branch '{branch.name}' is now {'Active' if branch.is_active else 'Deactivated'}.",
             'is_active': branch.is_active
         })
+
+    @action(detail=False, methods=['post'], url_path='setup-initial')
+    def setup_initial(self, request):
+        """
+        Atomically create initial branches for 'bar' and 'stationery' business units
+        so the Business Owner has at least one branch per business before adding products.
+        """
+        if request.user.role != User.ROLE_OWNER:
+            return Response(
+                {'error': 'Only the Business Owner can initialize branches.'},
+                status=status.HTTP_403_FORBIDDEN,
+            )
+
+        existing_unit_ids = set(
+            BusinessUnit.objects.filter(id__in=REQUIRED_UNIT_IDS, is_active=True).values_list('id', flat=True)
+        )
+        if not all(uid in existing_unit_ids for uid in REQUIRED_UNIT_IDS):
+            return Response(
+                {'error': 'Both Bar and Stationery business units must be created before adding branches.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        already_branched = set(
+            Branch.objects.filter(is_active=True, business_unit_id__in=REQUIRED_UNIT_IDS)
+            .values_list('business_unit_id', flat=True)
+            .distinct()
+        )
+
+        to_create = {}
+        seen_codes = set()
+        for unit_id in REQUIRED_UNIT_IDS:
+            raw = request.data.get(unit_id)
+            if not raw and unit_id in already_branched:
+                continue
+            if not isinstance(raw, dict):
+                return Response(
+                    {'error': f"A branch configuration for '{unit_id}' is required."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            name = (raw.get('name') or '').strip()
+            code = (raw.get('code') or '').strip().upper()
+            address = (raw.get('address') or '').strip()[:255]
+            phone = (raw.get('phone') or '').strip()[:50]
+
+            if not name:
+                return Response(
+                    {'error': f"Branch name for '{unit_id}' is required."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if not code or len(code) > 20:
+                return Response(
+                    {'error': f"Branch code for '{unit_id}' must be 1 to 20 characters."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if code in seen_codes:
+                return Response(
+                    {'error': 'Bar and Stationery branch codes must be unique.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if Branch.objects.filter(code__iexact=code).exists():
+                return Response(
+                    {'error': f"Branch code '{code}' is already in use."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+            seen_codes.add(code)
+            to_create[unit_id] = {
+                'name': name[:150],
+                'code': code,
+                'address': address,
+                'phone': phone,
+            }
+
+        with transaction.atomic():
+            for unit_id, data in to_create.items():
+                branch = Branch.objects.create(
+                    business_unit_id=unit_id,
+                    name=data['name'],
+                    code=data['code'],
+                    address=data['address'],
+                    phone=data['phone'],
+                    is_active=True,
+                )
+                record_audit(
+                    request=request,
+                    action='BRANCH_CREATED',
+                    entity_type='Branch',
+                    entity_id=branch.id,
+                    after_value={
+                        'name': branch.name,
+                        'code': branch.code,
+                        'address': branch.address,
+                        'business_unit': unit_id,
+                    },
+                )
+
+        all_branches = list(
+            Branch.objects.filter(is_active=True).values(
+                'id', 'business_unit_id', 'name', 'code', 'address', 'phone'
+            )
+        )
+        return Response(
+            {
+                'branches': all_branches,
+                'requires_branch_setup': False,
+            },
+            status=status.HTTP_201_CREATED,
+        )
 

@@ -1,4 +1,4 @@
-from .models import AuditLog
+from .models import AuditLog, BusinessUnit
 
 
 def get_client_ip(request):
@@ -36,6 +36,10 @@ def record_audit(
             business_unit_id = getattr(req_unit, 'id', req_unit)
     if not business_unit_id and effective_user and hasattr(effective_user, 'business_unit_id'):
         business_unit_id = effective_user.business_unit_id
+
+    # Guard against FK IntegrityError before BusinessUnits are initialized
+    if business_unit_id and not BusinessUnit.objects.filter(id=business_unit_id).exists():
+        business_unit_id = None
 
     ip = get_client_ip(request) if request else None
 

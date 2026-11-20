@@ -878,24 +878,6 @@ class OrderViewSet(viewsets.ModelViewSet):
             'cashier', 'shift', 'tab', 'customer'
         ).prefetch_related('items__product', 'payments').order_by('-created_at')
 
-    def destroy(self, request, *args, **kwargs):
-        return Response({
-            'error': 'Completed sales and orders are immutable legal records and cannot be deleted. If an order needs cancellation, use manager void authorization.',
-            'code': 'ORDER_DELETE_FORBIDDEN'
-        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
-
-    def update(self, request, *args, **kwargs):
-        return Response({
-            'error': 'Orders are immutable records and cannot be modified after transaction completion.',
-            'code': 'ORDER_UPDATE_FORBIDDEN'
-        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
-
-    def partial_update(self, request, *args, **kwargs):
-        return Response({
-            'error': 'Orders are immutable records and cannot be modified after transaction completion.',
-            'code': 'ORDER_UPDATE_FORBIDDEN'
-        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
-
         user = self.request.user
         params = self.request.query_params
 
@@ -972,6 +954,24 @@ class OrderViewSet(viewsets.ModelViewSet):
             )
 
         return qs.distinct()
+
+    def destroy(self, request, *args, **kwargs):
+        return Response({
+            'error': 'Completed sales and orders are immutable legal records and cannot be deleted. If an order needs cancellation, use manager void authorization.',
+            'code': 'ORDER_DELETE_FORBIDDEN'
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def update(self, request, *args, **kwargs):
+        return Response({
+            'error': 'Orders are immutable records and cannot be modified after transaction completion.',
+            'code': 'ORDER_UPDATE_FORBIDDEN'
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
+
+    def partial_update(self, request, *args, **kwargs):
+        return Response({
+            'error': 'Orders are immutable records and cannot be modified after transaction completion.',
+            'code': 'ORDER_UPDATE_FORBIDDEN'
+        }, status=status.HTTP_405_METHOD_NOT_ALLOWED)
 
     def list(self, request, *args, **kwargs):
         queryset = self.filter_queryset(self.get_queryset())

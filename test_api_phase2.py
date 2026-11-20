@@ -69,6 +69,8 @@ def run_tests():
     # Find a pack product, e.g. "Ballpoint Pens (Box of 50)"
     pen_product = Product.objects.filter(business_unit_id='stationery', is_pack=True, allow_split_sale=True).first()
     assert pen_product is not None, "Pack product with split sale not found!"
+    pen_product.stock_quantity = Decimal('100.00')
+    pen_product.save(update_fields=['stock_quantity'])
     initial_stock = pen_product.stock_quantity
     ratio = Decimal(pen_product.pack_unit_ratio)
     pack_price = pen_product.selling_price

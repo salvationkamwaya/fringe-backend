@@ -1,0 +1,58 @@
+# ==============================================================================
+# BACKEND DJANGO - GITIGNORE SPECIFICATION
+# ==============================================================================
+
+# Environment variables & secrets (CRITICAL: NEVER COMMIT SECRETS)
+.env
+.env.*
+*.env
+*.env.*
+!.env.example
+!*.env.example
+
+# Python bytecode & cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyc
+
+# Virtual environments
+fringe/
+venv/
+.venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# Django local database
+*.sqlite3
+*.db
+
+# Logs & debugging
+*.log
+logs/
+
+# Django media & static collections
+media/
+staticfiles/
+
+# Test & coverage artifacts
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+htmlcov/
+.pytest_cache/
+
+# IDE, OS, & editor configurations
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db

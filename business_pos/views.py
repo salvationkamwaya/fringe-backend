@@ -1933,7 +1933,22 @@ def stationery_reports_view(request):
 
     start_dt, end_dt, range_label, range_type, s_str, e_str = parse_date_range(request)
 
+    branch_id = getattr(request, 'branch_id', None)
+    if unit_id == 'all':
+        branch_id = None
+    elif not branch_id or branch_id == 'all':
+        if request.user.role != User.ROLE_OWNER:
+            branch_id = request.user.branch_id
+        else:
+            branch_id = None
+    if branch_id and str(branch_id).isdigit():
+        branch_id = int(branch_id)
+    else:
+        branch_id = None
+
     completed = Order.objects.filter(business_unit_id='stationery', status=Order.STATUS_COMPLETED)
+    if branch_id:
+        completed = completed.filter(branch_id=branch_id)
     if start_dt and end_dt:
         completed = completed.filter(created_at__range=(start_dt, end_dt))
 
@@ -1942,6 +1957,8 @@ def stationery_reports_view(request):
     avg_order_value = (total_revenue / total_orders) if total_orders > 0 else Decimal('0.00')
 
     payments = Payment.objects.filter(order__business_unit_id='stationery', order__status=Order.STATUS_COMPLETED)
+    if branch_id:
+        payments = payments.filter(order__branch_id=branch_id)
     if start_dt and end_dt:
         payments = payments.filter(order__created_at__range=(start_dt, end_dt))
 
@@ -1962,6 +1979,8 @@ def stationery_reports_view(request):
 
     # Pack vs Single split & COGS
     items = OrderItem.objects.filter(order__business_unit_id='stationery', order__status=Order.STATUS_COMPLETED)
+    if branch_id:
+        items = items.filter(order__branch_id=branch_id)
     if start_dt and end_dt:
         items = items.filter(order__created_at__range=(start_dt, end_dt))
     items = items.select_related('product')
@@ -2028,8 +2047,8 @@ def stationery_reports_view(request):
     gross_profit = total_revenue - cogs
     gross_margin = ((gross_profit / total_revenue) * 100) if total_revenue > 0 else Decimal('0.00')
 
-    # Operating Expenses (F9) & Net Profit
-    expenses_list = list_expenses(unit_id='stationery', start_date=s_str, end_date=e_str)
+    # Operating Expenses (F9) & Net Profit — scoped to Stationery & active branch (or all branches in Combined view)
+    expenses_list = list_expenses(unit_id='stationery', start_date=s_str, end_date=e_str, branch_id=branch_id)
     total_expenses = sum(Decimal(str(e.get('amount', 0))) for e in expenses_list)
     net_profit = gross_profit - total_expenses
     net_margin = ((net_profit / total_revenue) * 100) if total_revenue > 0 else Decimal('0.00')
@@ -2621,12 +2640,17 @@ def expenses_view(request):
     - Records operating costs (Rent, Transport, Electricity, Salaries, Repairs, etc.).
     """
     unit_id = getattr(request, 'business_unit', request.user.business_unit_id) or 'stationery'
-    
+    branch_id = getattr(request, 'branch_id', None)
+    if unit_id == 'all':
+        branch_id = None
+    elif not branch_id or branch_id == 'all':
+        branch_id = None if request.user.role == User.ROLE_OWNER else request.user.branch_id
+
     if request.method == 'GET':
         start = request.query_params.get('start_date')
         end = request.query_params.get('end_date')
         cat = request.query_params.get('category')
-        expenses = list_expenses(unit_id=unit_id, start_date=start, end_date=end, category=cat)
+        expenses = list_expenses(unit_id=unit_id, start_date=start, end_date=end, category=cat, branch_id=branch_id)
         total = sum(e.get('amount', 0) for e in expenses)
         
         category_totals = {}
@@ -2649,7 +2673,7 @@ def expenses_view(request):
             'error': 'Manager, Owner, or Stock Clerk privileges required to record expenses.'
         }, status=status.HTTP_403_FORBIDDEN)
 
-    record = add_expense(request.data, request.user, unit_id=unit_id)
+    record = add_expense(request.data, request.user, unit_id=unit_id, branch_id=branch_id)
     record_audit(
         request=request,
         action='EXPENSE_RECORDED',

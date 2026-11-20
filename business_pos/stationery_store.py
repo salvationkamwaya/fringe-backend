@@ -50,11 +50,14 @@ EXPENSE_CATEGORIES = [
 ]
 
 
-def list_expenses(unit_id='stationery', start_date=None, end_date=None, category=None):
+def list_expenses(unit_id='stationery', start_date=None, end_date=None, category=None, branch_id=None):
     items = _read_json(EXPENSES_FILE)
     filtered = []
+    branch_filter = str(branch_id) if (branch_id and str(branch_id) != 'all') else None
     for exp in items:
         if unit_id != 'all' and exp.get('business_unit') != unit_id:
+            continue
+        if branch_filter and str(exp.get('branch_id') or '') != branch_filter:
             continue
         if category and exp.get('category') != category:
             continue
@@ -70,14 +73,18 @@ def list_expenses(unit_id='stationery', start_date=None, end_date=None, category
     return filtered
 
 
-def add_expense(data, user, unit_id='stationery'):
+def add_expense(data, user, unit_id='stationery', branch_id=None):
     items = _read_json(EXPENSES_FILE)
     expense_id = f"EXP-{timezone.now().strftime('%y%m%d')}-{uuid.uuid4().hex[:4].upper()}"
     
     amount = float(Decimal(str(data.get('amount', '0.00'))))
+    effective_branch = data.get('branch_id') or branch_id
+    if effective_branch and str(effective_branch) == 'all':
+        effective_branch = None
     record = {
         'id': expense_id,
         'business_unit': unit_id,
+        'branch_id': str(effective_branch) if effective_branch else None,
         'title': data.get('title', '').strip(),
         'category': data.get('category', 'Miscellaneous & Sundry'),
         'amount': amount,

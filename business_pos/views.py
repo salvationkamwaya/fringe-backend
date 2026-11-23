@@ -1525,6 +1525,38 @@ def parse_date_range(request):
     return start, end, label, range_type, s_str, e_str
 
 
+def compute_order_item_unit_cost(item):
+    """
+    Return the true per-sold-unit cost (Decimal, 2dp) for an OrderItem.
+    - If the product is stocked in packs/crates/cases (is_pack=True, pack_unit_ratio > 1)
+      and this line was sold as single split units (not item.is_pack_sale),
+      the cost per sold unit is product.cost_price / pack_unit_ratio.
+    - Otherwise (sold as a full pack/crate/case, or a single-item-only product),
+      the cost per sold unit is product.cost_price.
+    """
+    product = item.product
+    pack_cost = Decimal(str(product.cost_price or '0.00'))
+    ratio = int(product.pack_unit_ratio or 1)
+    if product.is_pack and not item.is_pack_sale and ratio > 1:
+        return (pack_cost / Decimal(ratio)).quantize(Decimal('0.01'))
+    return pack_cost.quantize(Decimal('0.01'))
+
+
+def compute_order_item_cogs(item):
+    """
+    Return the true total COGS (Decimal, 2dp) for an OrderItem based on the
+    actual unit sold (single bottle/piece vs full crate/pack), preserving full
+    precision before multiplying by quantity and rounding at the line level.
+    """
+    product = item.product
+    pack_cost = Decimal(str(product.cost_price or '0.00'))
+    qty = Decimal(str(item.quantity or '0'))
+    ratio = int(product.pack_unit_ratio or 1)
+    if product.is_pack and not item.is_pack_sale and ratio > 1:
+        return ((pack_cost / Decimal(ratio)) * qty).quantize(Decimal('0.01'))
+    return (pack_cost * qty).quantize(Decimal('0.01'))
+
+
 def compute_inventory_valuation(products_qs):
     """
     Accurately computes Business Stock Worth across all 4 product situations:
@@ -1744,14 +1776,16 @@ def bar_reports_view(request):
 
     product_dict = {}
     for itm in items:
+        p = itm.product
         pid = itm.product_id
-        p_name = itm.product.name
-        is_alc = itm.product.is_alcoholic
-        cost_price = itm.product.cost_price
+        p_name = p.name
+        is_alc = p.is_alcoholic
+        is_pack_sale = bool(itm.is_pack_sale) if p.is_pack else False
+        unit_cost = compute_order_item_unit_cost(itm)
         selling_price = itm.unit_price
         qty = itm.quantity
         subtotal = itm.subtotal
-        item_cogs = cost_price * qty
+        item_cogs = compute_order_item_cogs(itm)
         cogs += item_cogs
         total_drinks_sold += qty
 
@@ -1762,22 +1796,30 @@ def bar_reports_view(request):
             non_alcoholic_revenue += subtotal
             non_alcoholic_count += qty
 
-        if pid not in product_dict:
-            product_dict[pid] = {
+        if p.is_pack and (p.pack_unit_ratio or 1) > 1:
+            sale_type = f"Full {p.pack_name or 'Pack'}" if is_pack_sale else f"Single {p.unit_name or 'Unit'}"
+        else:
+            sale_type = p.unit_name or 'Single'
+
+        key = (pid, is_pack_sale)
+        if key not in product_dict:
+            product_dict[key] = {
                 'product__id': pid,
                 'product__name': p_name,
                 'product__is_alcoholic': is_alc,
-                'unit_cost': str(cost_price),
+                'is_pack_sale': is_pack_sale,
+                'sale_type': sale_type,
+                'unit_cost': str(unit_cost),
                 'unit_price': str(selling_price),
                 'total_quantity': Decimal('0.00'),
                 'total_revenue': Decimal('0.00'),
                 'total_cogs': Decimal('0.00'),
                 'line_profit': Decimal('0.00'),
             }
-        product_dict[pid]['total_quantity'] += qty
-        product_dict[pid]['total_revenue'] += subtotal
-        product_dict[pid]['total_cogs'] += item_cogs
-        product_dict[pid]['line_profit'] += (subtotal - item_cogs)
+        product_dict[key]['total_quantity'] += qty
+        product_dict[key]['total_revenue'] += subtotal
+        product_dict[key]['total_cogs'] += item_cogs
+        product_dict[key]['line_profit'] += (subtotal - item_cogs)
 
     product_sales = []
     for p in product_dict.values():
@@ -1788,6 +1830,8 @@ def bar_reports_view(request):
             'product__id': p['product__id'],
             'product__name': p['product__name'],
             'product__is_alcoholic': p['product__is_alcoholic'],
+            'is_pack_sale': p['is_pack_sale'],
+            'sale_type': p['sale_type'],
             'unit_cost': p['unit_cost'],
             'unit_price': p['unit_price'],
             'total_quantity': int(p['total_quantity']),
@@ -2163,14 +2207,14 @@ def stationery_reports_view(request):
         p = itm.product
         qty = itm.quantity
         subtotal = itm.subtotal
-        is_pack = itm.is_pack_sale
+        is_pack = bool(itm.is_pack_sale) if p.is_pack else False
+        unit_cost = compute_order_item_unit_cost(itm)
+        item_cost = compute_order_item_cogs(itm)
 
-        if p.is_pack and not is_pack and p.allow_split_sale:
-            item_cost = (p.cost_price / Decimal(p.pack_unit_ratio)) * qty
+        if p.is_pack and not is_pack and (p.pack_unit_ratio or 1) > 1:
             single_sales_rev += subtotal
             single_sales_count += qty
         else:
-            item_cost = p.cost_price * qty
             pack_sales_rev += subtotal
             pack_sales_count += qty
 
@@ -2181,7 +2225,7 @@ def stationery_reports_view(request):
                 'product__id': p.id,
                 'product__name': p.name,
                 'is_pack_sale': is_pack,
-                'unit_cost': str(p.cost_price),
+                'unit_cost': str(unit_cost),
                 'total_quantity': Decimal('0.00'),
                 'total_revenue': Decimal('0.00'),
                 'total_cogs': Decimal('0.00'),
@@ -2587,7 +2631,7 @@ def consolidated_reports_view(request):
 
     bar_cogs = Decimal('0.00')
     for itm in bar_items:
-        bar_cogs += itm.product.cost_price * itm.quantity
+        bar_cogs += compute_order_item_cogs(itm)
     bar_profit = bar_revenue - bar_cogs
     bar_margin = ((bar_profit / bar_revenue) * 100) if bar_revenue > 0 else Decimal('0.00')
 
@@ -2620,11 +2664,7 @@ def consolidated_reports_view(request):
 
     stat_cogs = Decimal('0.00')
     for itm in stat_items:
-        p = itm.product
-        if p.is_pack and not itm.is_pack_sale and p.allow_split_sale:
-            stat_cogs += (p.cost_price / Decimal(p.pack_unit_ratio)) * itm.quantity
-        else:
-            stat_cogs += p.cost_price * itm.quantity
+        stat_cogs += compute_order_item_cogs(itm)
     stat_profit = stat_revenue - stat_cogs
     stat_margin = ((stat_profit / stat_revenue) * 100) if stat_revenue > 0 else Decimal('0.00')
 

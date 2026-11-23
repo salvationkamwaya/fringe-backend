@@ -84,7 +84,10 @@ class CategoryViewSet(viewsets.ModelViewSet):
             self.permission_denied(self.request, message=f"You do not have management permissions for business unit '{old_instance.business_unit_id}'.")
 
         old_name = old_instance.name
-        instance = serializer.save()
+        save_kwargs = {}
+        if serializer.validated_data.get('branch') is None and old_instance.branch_id:
+            save_kwargs['branch_id'] = old_instance.branch_id
+        instance = serializer.save(**save_kwargs)
         record_audit(
             request=self.request,
             action='CATEGORY_UPDATED',
@@ -209,7 +212,11 @@ class ProductViewSet(viewsets.ModelViewSet):
         old_price = str(old_instance.selling_price)
         old_stock = str(old_instance.stock_quantity)
 
-        instance = serializer.save()
+        save_kwargs = {}
+        if serializer.validated_data.get('branch') is None and old_instance.branch_id:
+            save_kwargs['branch_id'] = old_instance.branch_id
+
+        instance = serializer.save(**save_kwargs)
 
         # Audit price change if modified
         if str(instance.selling_price) != old_price:

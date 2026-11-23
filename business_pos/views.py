@@ -2107,10 +2107,13 @@ def stationery_reports_view(request):
     total_paid_to_suppliers = SupplierPayment.objects.filter(purchase_order__business_unit_id='stationery').aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
     total_payables_outstanding = max(Decimal('0.00'), total_po_cost - total_paid_to_suppliers)
 
-    # Inventory Valuation
+    # Inventory Valuation (scoped to active branch, or all branches in Combined view)
     stat_products = Product.objects.filter(business_unit_id='stationery', is_active=True)
+    if branch_id:
+        stat_products = stat_products.filter(branch_id=branch_id)
     val_at_cost = Decimal('0.00')
     val_at_retail = Decimal('0.00')
+    total_stock_units = Decimal('0.00')
     low_stock_count = 0
     out_of_stock_count = 0
     stock_on_hand = []
@@ -2118,6 +2121,7 @@ def stationery_reports_view(request):
     for sp in stat_products:
         val_at_cost += sp.stock_quantity * sp.cost_price
         val_at_retail += sp.stock_quantity * sp.selling_price
+        total_stock_units += sp.stock_quantity
         is_low = sp.stock_quantity <= sp.reorder_threshold
         is_out = sp.stock_quantity <= 0
         if is_out:
@@ -2362,9 +2366,11 @@ def stationery_reports_view(request):
         },
         'inventory_valuation': {
             'total_items': len(stat_products),
+            'total_stock_units': str(total_stock_units),
             'valuation_at_cost': str(val_at_cost),
             'valuation_at_retail': str(val_at_retail),
             'potential_gross_profit': str(val_at_retail - val_at_cost),
+            'expected_margin_percent': f"{(((val_at_retail - val_at_cost) / val_at_retail) * 100):.1f}%" if val_at_retail > 0 else "0.0%",
             'low_stock_count': low_stock_count,
             'out_of_stock_count': out_of_stock_count,
         },

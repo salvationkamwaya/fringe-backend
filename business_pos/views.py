@@ -1569,6 +1569,8 @@ def bar_reports_view(request):
 
     # Product Sales breakdown
     items = OrderItem.objects.filter(order__business_unit_id='bar', order__status=Order.STATUS_COMPLETED)
+    if branch_id:
+        items = items.filter(order__branch_id=branch_id)
     if start_dt and end_dt:
         items = items.filter(order__created_at__range=(start_dt, end_dt))
     items = items.select_related('product')
@@ -1638,6 +1640,12 @@ def bar_reports_view(request):
 
     gross_profit = total_revenue - cogs
     gross_margin = ((gross_profit / total_revenue) * 100) if total_revenue > 0 else Decimal('0.00')
+
+    # Bar-only Operating Expenses (strictly scoped to Bar & active branch)
+    bar_expenses_list = list_expenses(unit_id='bar', start_date=s_str, end_date=e_str, branch_id=branch_id)
+    bar_total_expenses = sum(Decimal(str(e.get('amount', 0))) for e in bar_expenses_list)
+    bar_net_profit = gross_profit - bar_total_expenses
+    bar_net_margin = ((bar_net_profit / total_revenue) * 100) if total_revenue > 0 else Decimal('0.00')
 
     # Inventory Valuation
     bar_products = Product.objects.filter(business_unit_id='bar', is_active=True)
@@ -1906,11 +1914,23 @@ def bar_reports_view(request):
                 business_unit_id='bar', is_active=True
             )
         ] if request.user.role == User.ROLE_OWNER else [],
+        'expenses': {
+            'total_expenses': str(bar_total_expenses),
+            'count': len(bar_expenses_list),
+            'categories': {
+                cat: str(sum(Decimal(str(e.get('amount', 0))) for e in bar_expenses_list if e.get('category') == cat))
+                for cat in EXPENSE_CATEGORIES if any(e.get('category') == cat for e in bar_expenses_list)
+            },
+            'recent': bar_expenses_list[:25]
+        },
         'profit_snapshot': {
             'total_revenue': str(total_revenue),
             'cogs': str(cogs),
             'gross_profit': str(gross_profit),
             'gross_margin_percent': f"{gross_margin:.1f}%",
+            'total_expenses': str(bar_total_expenses),
+            'net_profit': str(bar_net_profit),
+            'net_margin_percent': f"{bar_net_margin:.1f}%",
         }
     })
 
@@ -2491,6 +2511,14 @@ def consolidated_reports_view(request):
     group_inventory_cost = bar_stock_cost + stat_stock_cost
     group_inventory_retail = bar_stock_retail + stat_stock_retail
 
+    # Combined Operating Expenses (Bar + Stationery separated & totaled)
+    bar_expenses_list = list_expenses(unit_id='bar', start_date=s_str, end_date=e_str)
+    stat_expenses_list = list_expenses(unit_id='stationery', start_date=s_str, end_date=e_str)
+    bar_expenses_total = sum(Decimal(str(e.get('amount', 0))) for e in bar_expenses_list)
+    stat_expenses_total = sum(Decimal(str(e.get('amount', 0))) for e in stat_expenses_list)
+    group_expenses_total = bar_expenses_total + stat_expenses_total
+    group_net_profit = group_profit - group_expenses_total
+
     bar_share = ((bar_revenue / group_revenue) * 100) if group_revenue > 0 else Decimal('0.00')
     stat_share = ((stat_revenue / group_revenue) * 100) if group_revenue > 0 else Decimal('0.00')
 
@@ -2594,6 +2622,8 @@ def consolidated_reports_view(request):
             'group_drawer_cash': str(group_drawer_cash),
             'group_inventory_cost': str(group_inventory_cost),
             'group_inventory_retail': str(group_inventory_retail),
+            'group_expenses': str(group_expenses_total),
+            'group_net_profit': str(group_net_profit),
             'total_receivables': str(total_receivables),
             'total_payables': str(total_payables),
             'net_working_capital': str(net_working_capital),
@@ -2607,6 +2637,8 @@ def consolidated_reports_view(request):
                 'cogs': str(bar_cogs),
                 'gross_profit': str(bar_profit),
                 'gross_margin_percent': f"{bar_margin:.1f}%",
+                'expenses': str(bar_expenses_total),
+                'net_profit': str(bar_profit - bar_expenses_total),
                 'cash_in_drawer': str(bar_cash),
                 'mobile_money': str(bar_momo),
                 'inventory_cost': str(bar_stock_cost),
@@ -2620,6 +2652,8 @@ def consolidated_reports_view(request):
                 'cogs': str(stat_cogs),
                 'gross_profit': str(stat_profit),
                 'gross_margin_percent': f"{stat_margin:.1f}%",
+                'expenses': str(stat_expenses_total),
+                'net_profit': str(stat_profit - stat_expenses_total),
                 'cash_in_drawer': str(stat_drawer_cash),
                 'cash_sales': str(stat_cash),
                 'mobile_money': str(stat_momo),

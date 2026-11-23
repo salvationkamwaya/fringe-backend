@@ -191,24 +191,40 @@ def update_quotation_status(quote_id, status, converted_order_number=None, unit_
 # ==========================================
 # 3. RETURNS & REFUNDS (F8)
 # ==========================================
-def list_returns(unit_id='stationery'):
+def list_returns(unit_id='stationery', start_date=None, end_date=None, branch_id=None):
     items = _read_json(RETURNS_FILE)
-    filtered = [x for x in items if unit_id == 'all' or x.get('business_unit') == unit_id]
+    filtered = []
+    branch_filter = str(branch_id) if (branch_id and str(branch_id) != 'all') else None
+    for x in items:
+        if unit_id != 'all' and x.get('business_unit') != unit_id:
+            continue
+        if branch_filter and str(x.get('branch_id') or '') != branch_filter:
+            continue
+        ret_date = (x.get('created_at') or '')[:10]
+        if start_date and ret_date and ret_date < str(start_date)[:10]:
+            continue
+        if end_date and ret_date and ret_date > str(end_date)[:10]:
+            continue
+        filtered.append(x)
     filtered.sort(key=lambda x: x.get('created_at', ''), reverse=True)
     return filtered
 
 
-def create_return(data, user, approver=None, unit_id='stationery'):
+def create_return(data, user, approver=None, unit_id='stationery', branch_id=None):
     items = _read_json(RETURNS_FILE)
     return_number = f"RET-{timezone.now().strftime('%y%m%d%H%M')}-{uuid.uuid4().hex[:4].upper()}"
 
     lines = data.get('items', [])
     total_refund = sum(float(l.get('refund_amount', l.get('subtotal', 0))) for l in lines)
+    effective_branch = data.get('branch_id') or branch_id
+    if effective_branch and str(effective_branch) == 'all':
+        effective_branch = None
 
     record = {
         'id': return_number,
         'return_number': return_number,
         'business_unit': unit_id,
+        'branch_id': str(effective_branch) if effective_branch else None,
         'order_number': data.get('order_number', '').strip(),
         'customer_id': data.get('customer_id'),
         'customer_name': data.get('customer_name', 'Walk-in Customer'),

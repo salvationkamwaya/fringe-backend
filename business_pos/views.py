@@ -1525,6 +1525,166 @@ def parse_date_range(request):
     return start, end, label, range_type, s_str, e_str
 
 
+def compute_inventory_valuation(products_qs):
+    """
+    Accurately computes Business Stock Worth across all 4 product situations:
+    1. Single-Item Only (is_pack=False)
+    2. Pack-Only (is_pack=True, allow_split_sale=False)
+    3. Dual Pack + Split Singles (is_pack=True, allow_split_sale=True)
+    4. Partially opened packs (whole packs at pack price + loose pieces at single price)
+    Returns (valuation_dict, stock_on_hand_list).
+    """
+    val_at_cost = Decimal('0.00')
+    val_at_standard = Decimal('0.00')
+    val_at_max_split = Decimal('0.00')
+    total_stock_units = Decimal('0.00')
+    low_stock_count = 0
+    out_of_stock_count = 0
+
+    pack_count = 0
+    pack_total_packs = Decimal('0.00')
+    pack_total_pieces = Decimal('0.00')
+    pack_buying = Decimal('0.00')
+    pack_selling_std = Decimal('0.00')
+    pack_selling_max = Decimal('0.00')
+
+    single_count = 0
+    single_total_units = Decimal('0.00')
+    single_buying = Decimal('0.00')
+    single_selling = Decimal('0.00')
+
+    stock_on_hand = []
+
+    for prod in products_qs:
+        raw_qty = prod.stock_quantity or Decimal('0.00')
+        qty = max(Decimal('0.00'), raw_qty)
+        cost_price = prod.cost_price or Decimal('0.00')
+        selling_price = prod.selling_price or Decimal('0.00')
+        reorder = prod.reorder_threshold or Decimal('0.00')
+
+        is_out = raw_qty <= 0
+        is_low = (not is_out) and (raw_qty <= reorder)
+        if is_out:
+            out_of_stock_count += 1
+        elif is_low:
+            low_stock_count += 1
+
+        item_cost = qty * cost_price
+        total_stock_units += qty
+
+        if prod.is_pack:
+            ratio = max(1, int(prod.pack_unit_ratio or 1))
+            ratio_dec = Decimal(ratio)
+            pieces = qty * ratio_dec
+            if prod.allow_split_sale:
+                product_type_code = 'dual_split'
+                split_price = (
+                    prod.split_unit_price
+                    if (prod.split_unit_price and prod.split_unit_price > 0)
+                    else (selling_price / ratio_dec)
+                )
+                whole_packs = int(qty)
+                loose_pieces = (qty - Decimal(whole_packs)) * ratio_dec
+                item_std_sell = (Decimal(whole_packs) * selling_price) + (loose_pieces * split_price)
+                item_max_sell = pieces * split_price
+            else:
+                product_type_code = 'pack_only'
+                item_std_sell = qty * selling_price
+                item_max_sell = item_std_sell
+
+            pack_count += 1
+            pack_total_packs += qty
+            pack_total_pieces += pieces
+            pack_buying += item_cost
+            pack_selling_std += item_std_sell
+            pack_selling_max += item_max_sell
+        else:
+            product_type_code = 'single_only'
+            item_std_sell = qty * selling_price
+            item_max_sell = item_std_sell
+
+            single_count += 1
+            single_total_units += qty
+            single_buying += item_cost
+            single_selling += item_std_sell
+
+        val_at_cost += item_cost
+        val_at_standard += item_std_sell
+        val_at_max_split += item_max_sell
+
+        stock_on_hand.append({
+            'id': prod.id,
+            'name': prod.name,
+            'branch_id': prod.branch_id,
+            'branch_name': getattr(prod.branch, 'name', None) if prod.branch_id else None,
+            'stock_quantity': str(raw_qty),
+            'reorder_threshold': str(reorder),
+            'cost_price': str(cost_price),
+            'selling_price': str(selling_price),
+            'split_unit_price': str(prod.split_unit_price) if prod.split_unit_price else None,
+            'pack_unit_ratio': int(prod.pack_unit_ratio or 1),
+            'is_pack': bool(prod.is_pack),
+            'allow_split_sale': bool(prod.allow_split_sale),
+            'pack_name': prod.pack_name or 'Pack',
+            'unit_name': prod.unit_name or 'Piece',
+            'is_alcoholic': bool(prod.is_alcoholic),
+            'product_type_code': product_type_code,
+            'valuation_cost': str(item_cost.quantize(Decimal('0.01'))),
+            'valuation_retail': str(item_std_sell.quantize(Decimal('0.01'))),
+            'valuation_max_split': str(item_max_sell.quantize(Decimal('0.01'))),
+            'status': 'Out of Stock' if is_out else ('Low Stock' if is_low else 'Optimal')
+        })
+
+    stock_on_hand.sort(key=lambda x: Decimal(x['stock_quantity']))
+
+    std_profit = val_at_standard - val_at_cost
+    max_profit = val_at_max_split - val_at_cost
+    split_upside = max(Decimal('0.00'), val_at_max_split - val_at_standard)
+    std_margin = ((std_profit / val_at_standard) * 100) if val_at_standard > 0 else Decimal('0.00')
+    max_margin = ((max_profit / val_at_max_split) * 100) if val_at_max_split > 0 else Decimal('0.00')
+
+    pack_profit_std = pack_selling_std - pack_buying
+    pack_profit_max = pack_selling_max - pack_buying
+    single_profit = single_selling - single_buying
+    single_margin = ((single_profit / single_selling) * 100) if single_selling > 0 else Decimal('0.00')
+
+    valuation = {
+        'total_items': pack_count + single_count,
+        'total_units': int(total_stock_units),
+        'total_stock_units': str(total_stock_units.quantize(Decimal('0.01'))),
+        'valuation_at_cost': str(val_at_cost.quantize(Decimal('0.01'))),
+        'valuation_at_retail': str(val_at_standard.quantize(Decimal('0.01'))),
+        'valuation_at_max_split': str(val_at_max_split.quantize(Decimal('0.01'))),
+        'potential_gross_profit': str(std_profit.quantize(Decimal('0.01'))),
+        'potential_max_profit': str(max_profit.quantize(Decimal('0.01'))),
+        'split_upside': str(split_upside.quantize(Decimal('0.01'))),
+        'expected_margin_percent': f"{std_margin:.1f}%",
+        'max_margin_percent': f"{max_margin:.1f}%",
+        'low_stock_count': low_stock_count,
+        'out_of_stock_count': out_of_stock_count,
+        'pack_products': {
+            'count': pack_count,
+            'total_packs': str(pack_total_packs.quantize(Decimal('0.01'))),
+            'total_pieces': str(pack_total_pieces.quantize(Decimal('0.01'))),
+            'buying_worth': str(pack_buying.quantize(Decimal('0.01'))),
+            'selling_standard': str(pack_selling_std.quantize(Decimal('0.01'))),
+            'selling_max_split': str(pack_selling_max.quantize(Decimal('0.01'))),
+            'profit_standard': str(pack_profit_std.quantize(Decimal('0.01'))),
+            'profit_max_split': str(pack_profit_max.quantize(Decimal('0.01'))),
+            'split_upside': str(max(Decimal('0.00'), pack_selling_max - pack_selling_std).quantize(Decimal('0.01'))),
+        },
+        'single_products': {
+            'count': single_count,
+            'total_units': str(single_total_units.quantize(Decimal('0.01'))),
+            'buying_worth': str(single_buying.quantize(Decimal('0.01'))),
+            'selling_worth': str(single_selling.quantize(Decimal('0.01'))),
+            'expected_profit': str(single_profit.quantize(Decimal('0.01'))),
+            'margin_percent': f"{single_margin:.1f}%",
+        },
+    }
+    return valuation, stock_on_hand
+
+
 @api_view(['GET'])
 @permission_classes([permissions.IsAuthenticated])
 def bar_reports_view(request):
@@ -1641,47 +1801,34 @@ def bar_reports_view(request):
     gross_profit = total_revenue - cogs
     gross_margin = ((gross_profit / total_revenue) * 100) if total_revenue > 0 else Decimal('0.00')
 
-    # Bar-only Operating Expenses (strictly scoped to Bar & active branch)
+    # Bar-only Refunds & Operating Expenses (strictly scoped to Bar & active branch)
+    bar_returns_list = list_returns(unit_id='bar', start_date=s_str, end_date=e_str, branch_id=branch_id)
+    bar_total_refunds = sum(Decimal(str(r.get('total_refund', 0))) for r in bar_returns_list)
+    bar_cash_refunds = sum(
+        Decimal(str(r.get('total_refund', 0)))
+        for r in bar_returns_list
+        if str(r.get('refund_method', 'CASH')).upper() == 'CASH'
+    )
     bar_expenses_list = list_expenses(unit_id='bar', start_date=s_str, end_date=e_str, branch_id=branch_id)
     bar_total_expenses = sum(Decimal(str(e.get('amount', 0))) for e in bar_expenses_list)
-    bar_net_profit = gross_profit - bar_total_expenses
-    bar_net_margin = ((bar_net_profit / total_revenue) * 100) if total_revenue > 0 else Decimal('0.00')
 
-    # Inventory Valuation
-    bar_products = Product.objects.filter(business_unit_id='bar', is_active=True)
+    actual_revenue = total_revenue - bar_total_refunds
+    gross_profit = actual_revenue - cogs
+    gross_margin = ((gross_profit / actual_revenue) * 100) if actual_revenue > 0 else Decimal('0.00')
+    bar_net_profit = gross_profit - bar_total_expenses
+    bar_net_margin = ((bar_net_profit / actual_revenue) * 100) if actual_revenue > 0 else Decimal('0.00')
+    actual_net_cash = actual_revenue - bar_total_expenses
+
+    # Inventory Valuation (separated Pack/Bulk vs Single-Item Only)
+    bar_products = Product.objects.filter(business_unit_id='bar', is_active=True).select_related('branch')
     if branch_id:
         bar_products = bar_products.filter(branch_id=branch_id)
-    val_at_cost = Decimal('0.00')
-    val_at_retail = Decimal('0.00')
-    total_stock_units = Decimal('0.00')
-    low_stock_count = 0
-    out_of_stock_count = 0
-    stock_on_hand = []
-
-    for bp in bar_products:
-        val_at_cost += bp.stock_quantity * bp.cost_price
-        val_at_retail += bp.stock_quantity * bp.selling_price
-        total_stock_units += bp.stock_quantity
-        is_low = bp.stock_quantity <= bp.reorder_threshold
-        is_out = bp.stock_quantity <= 0
-        if is_out:
-            out_of_stock_count += 1
-        elif is_low:
-            low_stock_count += 1
-
-        stock_on_hand.append({
-            'id': bp.id,
-            'name': bp.name,
-            'stock_quantity': str(bp.stock_quantity),
-            'reorder_threshold': str(bp.reorder_threshold),
-            'cost_price': str(bp.cost_price),
-            'selling_price': str(bp.selling_price),
-            'is_alcoholic': bp.is_alcoholic,
-            'valuation_cost': str(bp.stock_quantity * bp.cost_price),
-            'valuation_retail': str(bp.stock_quantity * bp.selling_price),
-            'status': 'Out of Stock' if is_out else ('Low Stock' if is_low else 'Optimal')
-        })
-    stock_on_hand.sort(key=lambda x: Decimal(x['stock_quantity']))
+    bar_valuation, stock_on_hand = compute_inventory_valuation(bar_products)
+    val_at_cost = Decimal(bar_valuation['valuation_at_cost'])
+    val_at_retail = Decimal(bar_valuation['valuation_at_retail'])
+    total_stock_units = Decimal(bar_valuation['total_stock_units'])
+    low_stock_count = bar_valuation['low_stock_count']
+    out_of_stock_count = bar_valuation['out_of_stock_count']
 
     # Recent Shifts
     shifts_query = Shift.objects.filter(business_unit_id='bar')
@@ -1866,6 +2013,14 @@ def bar_reports_view(request):
             'cogs': str(cogs),
             'gross_profit': str(gross_profit),
             'gross_margin_percent': f"{gross_margin:.1f}%",
+            'total_refunds': str(bar_total_refunds),
+            'actual_revenue': str(actual_revenue),
+            'total_expenses': str(bar_total_expenses),
+            'total_liabilities': str(bar_total_refunds + bar_total_expenses),
+            'actual_net_cash': str(actual_net_cash),
+            'net_profit': str(bar_net_profit),
+            'net_margin_percent': f"{bar_net_margin:.1f}%",
+            'expected_cash_drawer': str(cash_total - bar_cash_refunds),
             'alcoholic_revenue': str(alcoholic_revenue),
             'alcoholic_count': int(alcoholic_count),
             'non_alcoholic_revenue': str(non_alcoholic_revenue),
@@ -1878,15 +2033,7 @@ def bar_reports_view(request):
             'mobile_money_count': momo_count,
             'total_tendered': str(cash_total + momo_total)
         },
-        'inventory_valuation': {
-            'total_items': len(bar_products),
-            'total_units': int(total_stock_units),
-            'valuation_at_cost': str(val_at_cost),
-            'valuation_at_retail': str(val_at_retail),
-            'potential_gross_profit': str(val_at_retail - val_at_cost),
-            'low_stock_count': low_stock_count,
-            'out_of_stock_count': out_of_stock_count,
-        },
+        'inventory_valuation': bar_valuation,
         'product_sales': product_sales,
         'stock_on_hand': stock_on_hand,
         'recent_shifts': recent_shifts,
@@ -2064,14 +2211,23 @@ def stationery_reports_view(request):
         })
     product_sales.sort(key=lambda x: Decimal(x['total_revenue']), reverse=True)
 
-    gross_profit = total_revenue - cogs
-    gross_margin = ((gross_profit / total_revenue) * 100) if total_revenue > 0 else Decimal('0.00')
-
-    # Operating Expenses (F9) & Net Profit — scoped to Stationery & active branch (or all branches in Combined view)
+    # Stationery-only Refunds & Operating Expenses (strictly scoped to Stationery & active branch)
+    returns_list = list_returns(unit_id='stationery', start_date=s_str, end_date=e_str, branch_id=branch_id)
+    total_refunds = sum(Decimal(str(r.get('total_refund', 0))) for r in returns_list)
+    cash_refunds = sum(
+        Decimal(str(r.get('total_refund', 0)))
+        for r in returns_list
+        if str(r.get('refund_method', 'CASH')).upper() == 'CASH'
+    )
     expenses_list = list_expenses(unit_id='stationery', start_date=s_str, end_date=e_str, branch_id=branch_id)
     total_expenses = sum(Decimal(str(e.get('amount', 0))) for e in expenses_list)
+
+    actual_revenue = total_revenue - total_refunds
+    gross_profit = actual_revenue - cogs
+    gross_margin = ((gross_profit / actual_revenue) * 100) if actual_revenue > 0 else Decimal('0.00')
     net_profit = gross_profit - total_expenses
-    net_margin = ((net_profit / total_revenue) * 100) if total_revenue > 0 else Decimal('0.00')
+    net_margin = ((net_profit / actual_revenue) * 100) if actual_revenue > 0 else Decimal('0.00')
+    actual_net_cash = actual_revenue - total_expenses
 
     # Retail vs Wholesale Breakdown (F1.2 & F4 & F5)
     wholesale_orders = completed.filter(order_number__contains='-WS-')
@@ -2128,41 +2284,15 @@ def stationery_reports_view(request):
     total_payables_outstanding = max(Decimal('0.00'), total_po_cost - total_paid_to_suppliers)
 
     # Inventory Valuation (scoped to active branch, or all branches in Combined view)
-    stat_products = Product.objects.filter(business_unit_id='stationery', is_active=True)
+    stat_products = Product.objects.filter(business_unit_id='stationery', is_active=True).select_related('branch')
     if branch_id:
         stat_products = stat_products.filter(branch_id=branch_id)
-    val_at_cost = Decimal('0.00')
-    val_at_retail = Decimal('0.00')
-    total_stock_units = Decimal('0.00')
-    low_stock_count = 0
-    out_of_stock_count = 0
-    stock_on_hand = []
-
-    for sp in stat_products:
-        val_at_cost += sp.stock_quantity * sp.cost_price
-        val_at_retail += sp.stock_quantity * sp.selling_price
-        total_stock_units += sp.stock_quantity
-        is_low = sp.stock_quantity <= sp.reorder_threshold
-        is_out = sp.stock_quantity <= 0
-        if is_out:
-            out_of_stock_count += 1
-        elif is_low:
-            low_stock_count += 1
-
-        stock_on_hand.append({
-            'id': sp.id,
-            'name': sp.name,
-            'stock_quantity': str(sp.stock_quantity),
-            'reorder_threshold': str(sp.reorder_threshold),
-            'cost_price': str(sp.cost_price),
-            'selling_price': str(sp.selling_price),
-            'is_pack': sp.is_pack,
-            'pack_name': sp.pack_name,
-            'valuation_cost': str(sp.stock_quantity * sp.cost_price),
-            'valuation_retail': str(sp.stock_quantity * sp.selling_price),
-            'status': 'Out of Stock' if is_out else ('Low Stock' if is_low else 'Optimal')
-        })
-    stock_on_hand.sort(key=lambda x: Decimal(x['stock_quantity']))
+    stat_valuation, stock_on_hand = compute_inventory_valuation(stat_products)
+    val_at_cost = Decimal(stat_valuation['valuation_at_cost'])
+    val_at_retail = Decimal(stat_valuation['valuation_at_retail'])
+    total_stock_units = Decimal(stat_valuation['total_stock_units'])
+    low_stock_count = stat_valuation['low_stock_count']
+    out_of_stock_count = stat_valuation['out_of_stock_count']
 
     # PDF Download Check
     if request.query_params.get('export') == 'pdf':
@@ -2336,11 +2466,15 @@ def stationery_reports_view(request):
         },
         'end_of_day': {
             'total_revenue': str(total_revenue),
+            'total_refunds': str(total_refunds),
+            'actual_revenue': str(actual_revenue),
+            'total_liabilities': str(total_refunds + total_expenses),
+            'actual_net_cash': str(actual_net_cash),
             'cash_sales': str(cash_sales),
             'mobile_sales': str(mobile_sales),
             'credit_sales': str(credit_sales),
             'debt_recovered': str(debt_recovered),
-            'expected_cash_drawer': str(cash_sales + debt_recovered),
+            'expected_cash_drawer': str(cash_sales + debt_recovered - cash_refunds),
             'total_debtors_balance': str(total_debtors),
             'total_orders': total_orders,
             'avg_order_value': f"{avg_order_value:.2f}",
@@ -2384,16 +2518,38 @@ def stationery_reports_view(request):
             'total_paid': str(total_paid_to_suppliers),
             'outstanding_payables': str(total_payables_outstanding)
         },
-        'inventory_valuation': {
-            'total_items': len(stat_products),
-            'total_stock_units': str(total_stock_units),
-            'valuation_at_cost': str(val_at_cost),
-            'valuation_at_retail': str(val_at_retail),
-            'potential_gross_profit': str(val_at_retail - val_at_cost),
-            'expected_margin_percent': f"{(((val_at_retail - val_at_cost) / val_at_retail) * 100):.1f}%" if val_at_retail > 0 else "0.0%",
-            'low_stock_count': low_stock_count,
-            'out_of_stock_count': out_of_stock_count,
-        },
+        'inventory_valuation': stat_valuation,
+        'branch_breakdown': [
+            {
+                'id': b.id,
+                'name': b.name,
+                'code': b.code,
+                'total_revenue': str(
+                    Order.objects.filter(
+                        business_unit_id='stationery', branch_id=b.id, status=Order.STATUS_COMPLETED
+                    ).filter(
+                        **({'created_at__range': (start_dt, end_dt)} if start_dt and end_dt else {})
+                    ).aggregate(t=Sum('final_amount'))['t'] or Decimal('0.00')
+                ),
+                'total_orders': Order.objects.filter(
+                    business_unit_id='stationery', branch_id=b.id, status=Order.STATUS_COMPLETED
+                ).filter(
+                    **({'created_at__range': (start_dt, end_dt)} if start_dt and end_dt else {})
+                ).count(),
+                'total_expenses': str(
+                    sum(Decimal(str(e.get('amount', 0))) for e in list_expenses(unit_id='stationery', start_date=s_str, end_date=e_str, branch_id=b.id))
+                ),
+                'total_refunds': str(
+                    sum(Decimal(str(r.get('total_refund', 0))) for r in list_returns(unit_id='stationery', start_date=s_str, end_date=e_str, branch_id=b.id))
+                ),
+                'valuation': compute_inventory_valuation(
+                    Product.objects.filter(business_unit_id='stationery', branch_id=b.id, is_active=True)
+                )[0],
+            }
+            for b in __import__('business_core.models', fromlist=['Branch']).Branch.objects.filter(
+                business_unit_id='stationery', is_active=True
+            )
+        ] if request.user.role == User.ROLE_OWNER else [],
         'product_sales': product_sales,
         'stock_on_hand': stock_on_hand,
     })
@@ -2502,27 +2658,86 @@ def consolidated_reports_view(request):
     total_po_paid = SupplierPayment.objects.filter(purchase_order__business_unit_id='stationery').aggregate(t=Sum('amount'))['t'] or Decimal('0.00')
     total_payables = max(Decimal('0.00'), total_po_cost - total_po_paid)
 
-    # Combined Group Totals
-    group_revenue = bar_revenue + stat_revenue
-    group_cogs = bar_cogs + stat_cogs
-    group_profit = bar_profit + stat_profit
-    group_margin = ((group_profit / group_revenue) * 100) if group_revenue > 0 else Decimal('0.00')
-    group_drawer_cash = bar_cash + stat_drawer_cash
-    group_inventory_cost = bar_stock_cost + stat_stock_cost
-    group_inventory_retail = bar_stock_retail + stat_stock_retail
+    # Combined Group Valuations (Pack/Bulk vs Single-Item Only across all branches)
+    bar_valuation, _ = compute_inventory_valuation(bar_stock)
+    stat_valuation, _ = compute_inventory_valuation(stat_stock)
+    all_active_stock = Product.objects.filter(business_unit_id__in=['bar', 'stationery'], is_active=True).select_related('branch')
+    group_valuation, _ = compute_inventory_valuation(all_active_stock)
 
-    # Combined Operating Expenses (Bar + Stationery separated & totaled)
+    # Combined Refunds & Operating Expenses (Bar + Stationery separated & totaled)
+    bar_returns_list = list_returns(unit_id='bar', start_date=s_str, end_date=e_str)
+    stat_returns_list = list_returns(unit_id='stationery', start_date=s_str, end_date=e_str)
+    bar_refunds_total = sum(Decimal(str(r.get('total_refund', 0))) for r in bar_returns_list)
+    stat_refunds_total = sum(Decimal(str(r.get('total_refund', 0))) for r in stat_returns_list)
+    group_refunds_total = bar_refunds_total + stat_refunds_total
+
     bar_expenses_list = list_expenses(unit_id='bar', start_date=s_str, end_date=e_str)
     stat_expenses_list = list_expenses(unit_id='stationery', start_date=s_str, end_date=e_str)
     bar_expenses_total = sum(Decimal(str(e.get('amount', 0))) for e in bar_expenses_list)
     stat_expenses_total = sum(Decimal(str(e.get('amount', 0))) for e in stat_expenses_list)
     group_expenses_total = bar_expenses_total + stat_expenses_total
-    group_net_profit = group_profit - group_expenses_total
 
-    bar_share = ((bar_revenue / group_revenue) * 100) if group_revenue > 0 else Decimal('0.00')
-    stat_share = ((stat_revenue / group_revenue) * 100) if group_revenue > 0 else Decimal('0.00')
+    bar_actual_revenue = bar_revenue - bar_refunds_total
+    stat_actual_revenue = stat_revenue - stat_refunds_total
+    bar_profit = bar_actual_revenue - bar_cogs
+    stat_profit = stat_actual_revenue - stat_cogs
+    bar_margin = ((bar_profit / bar_actual_revenue) * 100) if bar_actual_revenue > 0 else Decimal('0.00')
+    stat_margin = ((stat_profit / stat_actual_revenue) * 100) if stat_actual_revenue > 0 else Decimal('0.00')
+
+    # Combined Group Totals
+    group_revenue = bar_revenue + stat_revenue
+    group_actual_revenue = bar_actual_revenue + stat_actual_revenue
+    group_cogs = bar_cogs + stat_cogs
+    group_profit = bar_profit + stat_profit
+    group_margin = ((group_profit / group_actual_revenue) * 100) if group_actual_revenue > 0 else Decimal('0.00')
+    group_drawer_cash = bar_cash + stat_drawer_cash
+    group_inventory_cost = Decimal(group_valuation['valuation_at_cost'])
+    group_inventory_retail = Decimal(group_valuation['valuation_at_retail'])
+    group_liabilities_total = group_refunds_total + group_expenses_total
+    group_net_profit = group_profit - group_expenses_total
+    group_net_margin = ((group_net_profit / group_actual_revenue) * 100) if group_actual_revenue > 0 else Decimal('0.00')
+    group_actual_net_cash = group_actual_revenue - group_expenses_total
+
+    bar_share = ((bar_actual_revenue / group_actual_revenue) * 100) if group_actual_revenue > 0 else Decimal('0.00')
+    stat_share = ((stat_actual_revenue / group_actual_revenue) * 100) if group_actual_revenue > 0 else Decimal('0.00')
 
     net_working_capital = (group_drawer_cash + total_receivables + group_inventory_cost) - total_payables
+
+    # All-Branches Breakdown (Bar + Stationery branches)
+    BranchModel = __import__('business_core.models', fromlist=['Branch']).Branch
+    all_branches_breakdown = []
+    for br in BranchModel.objects.filter(business_unit_id__in=['bar', 'stationery'], is_active=True).order_by('business_unit_id', 'name'):
+        br_orders = Order.objects.filter(
+            business_unit_id=br.business_unit_id, branch_id=br.id, status=Order.STATUS_COMPLETED
+        )
+        if start_dt and end_dt:
+            br_orders = br_orders.filter(created_at__range=(start_dt, end_dt))
+        br_rev = br_orders.aggregate(t=Sum('final_amount'))['t'] or Decimal('0.00')
+        br_count = br_orders.count()
+        br_refunds = sum(
+            Decimal(str(r.get('total_refund', 0)))
+            for r in list_returns(unit_id=br.business_unit_id, start_date=s_str, end_date=e_str, branch_id=br.id)
+        )
+        br_expenses = sum(
+            Decimal(str(e.get('amount', 0)))
+            for e in list_expenses(unit_id=br.business_unit_id, start_date=s_str, end_date=e_str, branch_id=br.id)
+        )
+        br_val, _ = compute_inventory_valuation(
+            Product.objects.filter(business_unit_id=br.business_unit_id, branch_id=br.id, is_active=True)
+        )
+        all_branches_breakdown.append({
+            'id': br.id,
+            'name': br.name,
+            'code': br.code,
+            'business_unit': br.business_unit_id,
+            'gross_revenue': str(br_rev),
+            'refunds': str(br_refunds),
+            'actual_revenue': str(br_rev - br_refunds),
+            'expenses': str(br_expenses),
+            'net_cash_after_liabilities': str(br_rev - br_refunds - br_expenses),
+            'orders_count': br_count,
+            'valuation': br_val,
+        })
 
     # PDF Download Check
     if request.query_params.get('export') == 'pdf':
@@ -2616,6 +2831,8 @@ def consolidated_reports_view(request):
         },
         'group_summary': {
             'group_revenue': str(group_revenue),
+            'group_refunds': str(group_refunds_total),
+            'group_actual_revenue': str(group_actual_revenue),
             'group_cogs': str(group_cogs),
             'group_profit': str(group_profit),
             'group_margin_percent': f"{group_margin:.1f}%",
@@ -2623,15 +2840,22 @@ def consolidated_reports_view(request):
             'group_inventory_cost': str(group_inventory_cost),
             'group_inventory_retail': str(group_inventory_retail),
             'group_expenses': str(group_expenses_total),
+            'group_liabilities': str(group_liabilities_total),
             'group_net_profit': str(group_net_profit),
+            'group_net_margin_percent': f"{group_net_margin:.1f}%",
+            'group_actual_net_cash': str(group_actual_net_cash),
             'total_receivables': str(total_receivables),
             'total_payables': str(total_payables),
             'net_working_capital': str(net_working_capital),
         },
+        'inventory_valuation': group_valuation,
+        'branches': all_branches_breakdown,
         'units': {
             'bar': {
                 'name': 'Bar & Lounge',
                 'revenue': str(bar_revenue),
+                'refunds': str(bar_refunds_total),
+                'actual_revenue': str(bar_actual_revenue),
                 'share_percent': f"{bar_share:.1f}%",
                 'orders_count': bar_orders_count,
                 'cogs': str(bar_cogs),
@@ -2641,12 +2865,15 @@ def consolidated_reports_view(request):
                 'net_profit': str(bar_profit - bar_expenses_total),
                 'cash_in_drawer': str(bar_cash),
                 'mobile_money': str(bar_momo),
-                'inventory_cost': str(bar_stock_cost),
-                'inventory_retail': str(bar_stock_retail)
+                'inventory_cost': bar_valuation['valuation_at_cost'],
+                'inventory_retail': bar_valuation['valuation_at_retail'],
+                'valuation': bar_valuation,
             },
             'stationery': {
                 'name': 'Stationery & Retail',
                 'revenue': str(stat_revenue),
+                'refunds': str(stat_refunds_total),
+                'actual_revenue': str(stat_actual_revenue),
                 'share_percent': f"{stat_share:.1f}%",
                 'orders_count': stat_orders_count,
                 'cogs': str(stat_cogs),
@@ -2661,8 +2888,9 @@ def consolidated_reports_view(request):
                 'debt_recovered': str(stat_debt_rec),
                 'receivables_owed': str(total_receivables),
                 'payables_owed': str(total_payables),
-                'inventory_cost': str(stat_stock_cost),
-                'inventory_retail': str(stat_stock_retail)
+                'inventory_cost': stat_valuation['valuation_at_cost'],
+                'inventory_retail': stat_valuation['valuation_at_retail'],
+                'valuation': stat_valuation,
             }
         }
     })

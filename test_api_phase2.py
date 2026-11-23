@@ -49,6 +49,11 @@ def run_tests():
     sarah_token = res_sarah.data['token']
     print(f" [OK] Sarah logged in. Role: {res_sarah.data['user']['role']}, Unit: {res_sarah.data['active_unit']}")
 
+    sarah_user = User.objects.filter(username='stationery_manager').first()
+    if sarah_user:
+        sarah_user.set_pin('5678')
+        sarah_user.save()
+
     # Setup client as Grace
     client.credentials(HTTP_AUTHORIZATION=f'Token {grace_token}')
     client.defaults['HTTP_X_BUSINESS_UNIT'] = 'stationery'
@@ -68,7 +73,25 @@ def run_tests():
     print("\n[TEST 3] Testing Unit vs. Pack pricing and fractional stock deduction...")
     # Find a pack product, e.g. "Ballpoint Pens (Box of 50)"
     pen_product = Product.objects.filter(business_unit_id='stationery', is_pack=True, allow_split_sale=True).first()
-    assert pen_product is not None, "Pack product with split sale not found!"
+    if not pen_product:
+        stat_cat = Category.objects.filter(business_unit_id='stationery').first()
+        if not stat_cat:
+            stat_cat = Category.objects.create(name='Office Supplies', business_unit_id='stationery')
+        pen_product = Product.objects.create(
+            name='Ballpoint Pens (Box of 50)',
+            category=stat_cat,
+            business_unit_id='stationery',
+            cost_price=Decimal('20000.00'),
+            selling_price=Decimal('25000.00'),
+            stock_quantity=Decimal('100.00'),
+            reorder_threshold=Decimal('5.00'),
+            is_pack=True,
+            pack_name='Box',
+            unit_name='Pen',
+            pack_unit_ratio=50,
+            allow_split_sale=True,
+            split_unit_price=Decimal('600.00')
+        )
     pen_product.stock_quantity = Decimal('100.00')
     pen_product.save(update_fields=['stock_quantity'])
     initial_stock = pen_product.stock_quantity

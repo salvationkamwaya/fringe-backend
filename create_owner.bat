@@ -12,3 +12,4 @@ if exist "%~dp0fringe\Scripts\python.exe" (
 ) else (
     python manage.py create_owner %*
 )
+

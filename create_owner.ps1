@@ -16,3 +16,4 @@ if (Test-Path "$scriptDir\fringe\Scripts\python.exe") {
 
 Write-Host "Running Owner Initialization via Django Management Command..." -ForegroundColor Cyan
 & $python "$scriptDir\manage.py" create_owner @args
+
